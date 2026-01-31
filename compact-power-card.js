@@ -3638,7 +3638,11 @@ class CompactPowerCard extends (window.LitElement ||
 
     const pvLabelPositions = [];
     const pvLabelPad = Math.max(16, baseWidth * 0.05);
-    const pvLabelSpacingBase = 56 * (baseWidth / designWidth);
+    const pvColumnWidth = columnCount > 0 ? baseWidth / columnCount : baseWidth / 12;
+    const pvLabelSpacingBase = Math.max(
+      pvColumnWidth * 1.5,
+      56 * (baseWidth / designWidth)
+    );
     const pvLabelCap = Math.max(4, maxItemsByColumns);
     const pvLabelY = 28;
 
@@ -3772,14 +3776,15 @@ class CompactPowerCard extends (window.LitElement ||
       (rowCount === 3 && gridLabels.length <= 1 && batteryLabelSource.length <= 1) ||
       (rowCount === 4 && (gridLabels.length <= 2 || batteryLabelSource.length <= 2));
     const pvLabelLimit = rowCount >= 5 || allowExtraPvLabels ? pvLabelCap : 4;
-    const pvRings = Math.max(1, Math.ceil(pvLabelLimit / 2));
+    const pvLabelCount = Math.min(pvLabels.length, pvLabelLimit);
+    const pvRings = Math.max(1, Math.ceil(pvLabelCount / 2));
     const pvMaxSpacing = (baseWidth / 2 - pvLabelPad) / pvRings;
     const pvLabelSpacing = Math.max(0, Math.min(pvLabelSpacingBase, pvMaxSpacing));
-    for (let ring = 1; pvLabelPositions.length < pvLabelLimit; ring++) {
+    for (let ring = 1; pvLabelPositions.length < pvLabelCount; ring++) {
       const leftX = pvCenterX - pvLabelSpacing * ring;
       const rightX = pvCenterX + pvLabelSpacing * ring;
       pvLabelPositions.push({ x: leftX });
-      if (pvLabelPositions.length < pvLabelLimit) {
+      if (pvLabelPositions.length < pvLabelCount) {
         pvLabelPositions.push({ x: rightX });
       }
       if (ring >= pvRings) break;
