@@ -1455,7 +1455,7 @@ class CompactPowerCard extends (window.LitElement ||
     }
     const baseWidth = 512; // match viewBox width
     const widthScale = hostWidth / baseWidth;
-    const scale = Math.max(0.7, Math.min(1, widthScale));
+    const scale = Math.max(0.8, Math.min(1.0, widthScale));
     this.style.setProperty("--cpc-scale", scale.toFixed(3));
   }
 
