@@ -68,6 +68,7 @@ This card is designed for the new [Home Assistant Sections UI](https://www.home-
 | Subtract devices from home | `subtract_devices_from_home` | If true, subtract summed devices from the home value. Default: `false`. |
 | Power Unit Override | `power_unit`| Set to W, kW or mW |
 | Curved Line Radius | `curve_factor`| Adjusts the curve radius. `0` to `5`, `1` is default. Set to `0` for straight lines. |
+| Font Size Multiplier | `font_size_multiplier`| Multiplies text sizes on top of the automatic `--cpc-scale`. Default `1.0`. |
 | Device Power Lines | `show_device_power_lines`| Set to `true` to light up devices when power is flowing beyond a threshold. Default `false` |
 | Home Icon Gradient | `disable_home_gradient`| Set to `true` if you want the home icon to be a single colour. |
 | Remove Glow Effects | `remove_glow_effects`| Set to `true` to disable drop shadow/glow effects. Default `false` (dark mode only). |

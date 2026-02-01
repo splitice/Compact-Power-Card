@@ -53,6 +53,10 @@ class CompactPowerCard extends (window.LitElement ||
                 selector: { number: { min: 0, max: 5, step: 0.5, mode: "slider" } },
               }, 
               {
+                name: "font_size_multiplier",
+                selector: { number: { min: 0.5, max: 2.0, step: 0.05, mode: "slider" } },
+              },
+              {
                 name: "enable_device_power_lines",
                 selector: { boolean: { } },
               },              
@@ -546,6 +550,11 @@ class CompactPowerCard extends (window.LitElement ||
       );
     }
     this._config = config;
+    const fontScaleRaw = this._parseNumberStrict(this._config?.font_size_multiplier);
+    const fontScale = Number.isFinite(fontScaleRaw)
+      ? Math.min(2.0, Math.max(0.5, fontScaleRaw))
+      : 1;
+    this.style.setProperty("--cpc-text-scale", String(fontScale));
     this._trackedEntityIds = this._collectEntityIds();
     this._lastEntityStates.clear();
     this._lastThemeMode = null;
@@ -558,6 +567,7 @@ class CompactPowerCard extends (window.LitElement ||
     return css`
       :host {
         --cpc-scale: 1;
+        --cpc-text-scale: 1;
         display: block;
         height: 100%;
       }
@@ -688,7 +698,7 @@ class CompactPowerCard extends (window.LitElement ||
       }
 
       .pv-label {
-        font-size: calc(16px * var(--cpc-scale, 1));
+        font-size: calc(16px * var(--cpc-scale, 1) * var(--cpc-text-scale, 1));
       }
 
       .node-marker {
@@ -821,7 +831,7 @@ class CompactPowerCard extends (window.LitElement ||
       }
 
       .node-label {
-        font-size: calc(16px * var(--cpc-scale, 1));
+        font-size: calc(16px * var(--cpc-scale, 1) * var(--cpc-text-scale, 1));
         display: flex;
         align-items: center;
         gap: 2px;
@@ -896,7 +906,7 @@ class CompactPowerCard extends (window.LitElement ||
       }
 
       .home-label {
-        font-size: calc(16px * var(--cpc-scale, 0.8));
+        font-size: calc(16px * var(--cpc-scale, 0.8) * var(--cpc-text-scale, 1));
         font-weight: 700;
         margin-top: calc(-16px * var(--cpc-scale, 0.8));
       }
@@ -940,7 +950,7 @@ class CompactPowerCard extends (window.LitElement ||
         display: flex;
         align-items: center;
         gap: 1px;
-        font-size: calc(10px * var(--cpc-scale, 1));
+        font-size: calc(10px * var(--cpc-scale, 1) * var(--cpc-text-scale, 1));
       }
 
       .aux-marker {
@@ -958,11 +968,11 @@ class CompactPowerCard extends (window.LitElement ||
       }
 
       .aux-label {
-        font-size: calc(12px * var(--cpc-scale, 1));
+        font-size: calc(12px * var(--cpc-scale, 1) * var(--cpc-text-scale, 1));
       }
 
       .aux-sub-label {
-        font-size: calc(11px * var(--cpc-scale, 1));
+        font-size: calc(11px * var(--cpc-scale, 1) * var(--cpc-text-scale, 1));
         font-weight: 500;
         opacity: 0.85;
         line-height: 1;
@@ -978,7 +988,7 @@ class CompactPowerCard extends (window.LitElement ||
       }
 
       .device-name {
-        font-size: calc(11px * var(--cpc-scale, 1));
+        font-size: calc(11px * var(--cpc-scale, 1) * var(--cpc-text-scale, 1));
         opacity: 0.85;
         font-weight: 500;
         display: inline-block;
