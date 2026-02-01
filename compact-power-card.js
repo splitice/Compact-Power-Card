@@ -1056,35 +1056,9 @@ class CompactPowerCard extends (window.LitElement ||
       ha-card.no-pv .canvas,
       :host(.no-battery) .canvas,
       ha-card.no-battery .canvas {
-        margin-top: 0px;
+        margin-top: -12px;
         margin-bottom: 0px;
       }
-
-      :host(.no-pv).has-single-side-label .canvas,
-      ha-card.no-pv.has-single-side-label .canvas,
-      :host(.no-battery).has-single-side-label .canvas,
-      ha-card.no-battery.has-single-side-label .canvas {
-        margin-top: -20px;
-      }
-
-      :host(.no-pv):not(.has-pv-labels):not(.has-grid-labels):not(.has-battery-labels) .canvas,
-      ha-card.no-pv:not(.has-pv-labels):not(.has-grid-labels):not(.has-battery-labels) .canvas,
-      :host(.no-battery):not(.has-pv-labels):not(.has-grid-labels):not(.has-battery-labels) .canvas,
-      ha-card.no-battery:not(.has-pv-labels):not(.has-grid-labels):not(.has-battery-labels) .canvas {
-        margin-top: -40px;
-        margin-bottom: 0px;
-      }
-
-      :host(.no-pv),
-      :host(.no-battery) {
-        height: auto;
-      }
-
-      ha-card.no-pv,
-      ha-card.no-battery {
-        height: auto;
-      }
-
 
       :host(.no-battery) #line-pv-battery,
       :host(.no-battery) #line-home-battery,
@@ -1199,27 +1173,33 @@ class CompactPowerCard extends (window.LitElement ||
     this._lastRowSize = rowSize;
   }
 
+  _shouldUseExternalHeight() {
+    return Boolean(this.closest("div.card.fit-rows"));
+  }
+
   _getLayoutMetrics({ hasPv, hasBattery, hasAnyLabels }) {
     const designWidth = 512;
     const designHeight = 184;
     const defaultWidth = 512;
-    const defaultHeight = 184;
+    const useExternalHeight = this._shouldUseExternalHeight();
+    const defaultHeight = !useExternalHeight && (!hasPv || !hasBattery) ? 150 : 184;
     const hostRect = this.getBoundingClientRect ? this.getBoundingClientRect() : null;
     const outerWidth = this._hostWidth != null ? this._hostWidth : hostRect?.width || defaultWidth;
-    const outerHeight =
-      this._externalHeight != null
+    const outerHeight = useExternalHeight
+      ? this._externalHeight != null
         ? this._externalHeight
         : this._hostHeight != null
         ? this._hostHeight
-        : hostRect?.height || defaultHeight;
+        : hostRect?.height || defaultHeight
+      : defaultHeight;
     const padX = 8; // ha-card left+right padding (4px each)
     const padY = 2; // bottom padding; top is 0
     const baseWidth = Math.max(0, outerWidth - padX);
-    const hasExternalHeight = outerHeight > defaultHeight + 32; // require meaningful external height to avoid slow creep
-    const compactTrim = (!hasPv || !hasBattery) && !hasAnyLabels ? 20 : 0;
+    const hasExternalHeight = useExternalHeight && (this._externalHeight != null || this._hostHeight != null);
+    const compactTrim = 0;
     const baseHeight = hasExternalHeight
       ? Math.max(0, outerHeight - padY - compactTrim)
-      : Math.max(0, designHeight - compactTrim);
+      : Math.max(0, outerHeight - padY - compactTrim);
     const renderScaleY = baseHeight > 0 ? (outerHeight - padY) / baseHeight : 1;
     const xScale = baseWidth / designWidth;
     const yScale = baseHeight / designHeight;
@@ -1420,12 +1400,7 @@ class CompactPowerCard extends (window.LitElement ||
           this._hostWidth = newW;
           this._hostHeight = newH;
           const widthChanged = prevW != null && newW !== prevW;
-          if (this._externalHeight == null) {
-            this._externalHeight = newH;
-          } else if (widthChanged || newH < this._externalHeight - 24) {
-            // Only trust height updates when the card width changes or on meaningful shrink.
-            this._externalHeight = newH;
-          }
+          this._externalHeight = newH;
           if (prevW == null || prevH == null) {
             this.requestUpdate();
           }
@@ -3147,6 +3122,7 @@ class CompactPowerCard extends (window.LitElement ||
       batteryNode,
       homeNode,
     } = layout;
+    const deviceYOffset = this._shouldUseExternalHeight() && rowCount < 3 ? 20 : 0;
     const labelBonus = !hasPv || !hasBattery ? (rowCount >= 4 ? 2 : 1) : 0;
     const gridBatteryBonus =
       hasPv && hasBattery && pvLabels.length <= 4
@@ -3458,7 +3434,7 @@ class CompactPowerCard extends (window.LitElement ||
     const cornerBaseRadius = pvGridTurnRadius;
     const sourcePositions = [];
     const homeX = homeCenterX;
-    const homeRowYBase = 145; // base Y for aux row; actual Y will be adjusted via pctHomeY
+    const homeRowYBase = 145 + deviceYOffset; // base Y for aux row; actual Y will be adjusted via pctHomeY
 
     const deviceFlickerMs = 500;
     const deviceFlickerNow = Date.now();
