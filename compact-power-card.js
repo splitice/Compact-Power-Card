@@ -1122,6 +1122,11 @@ class CompactPowerCard extends (window.LitElement ||
         display: none;
       }
 
+      :host(.pv-as-battery) .pv-marker .node-label,
+      ha-card.pv-as-battery .pv-marker .node-label {
+        transform: translateY(-3px);
+      }
+
 
       :host(.no-pv) #line-pv-grid,
       :host(.no-pv) #line-pv-home,
