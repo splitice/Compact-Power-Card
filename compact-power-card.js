@@ -615,6 +615,20 @@ class CompactPowerCard extends (window.LitElement ||
         vector-effect: non-scaling-stroke;
       }
 
+      .flow-dot {
+        opacity: 0;
+        pointer-events: none;
+        offset-rotate: 0deg;
+        offset-anchor: center;
+        transform-box: fill-box;
+        transform-origin: center;
+        will-change: offset-distance, opacity;
+      }
+
+      .flow-dot.active {
+        animation: cpc-flow-dot var(--cpc-flow-duration, 1500ms) linear infinite;
+      }
+
       .device-line {
         fill: none;
         stroke-linecap: round;
@@ -936,6 +950,23 @@ class CompactPowerCard extends (window.LitElement ||
         }
         100% {
           transform: scale(0.85);
+        }
+      }
+
+      @keyframes cpc-flow-dot {
+        0% {
+          offset-distance: var(--cpc-flow-start, 0%);
+          opacity: 0;
+        }
+        5% {
+          opacity: 1;
+        }
+        85% {
+          opacity: 1;
+        }
+        100% {
+          offset-distance: var(--cpc-flow-end, 100%);
+          opacity: 0;
         }
       }
 
@@ -2860,121 +2891,121 @@ class CompactPowerCard extends (window.LitElement ||
     }
   }
 
+  _getFlowMotionSpec(geom) {
+    if (!geom) return null;
+
+    if (geom.mode === "path") {
+      const pathId = geom.pathId || null;
+      const pathEl = pathId ? this.shadowRoot?.getElementById(pathId) : null;
+      const pathData = pathEl?.getAttribute?.("d") || null;
+      if (pathData) {
+        return {
+          offsetPath: `path("${pathData.replace(/\s+/g, " ").trim()}")`,
+          reverse: Boolean(geom.reverse),
+        };
+      }
+      if (geom.fallback) {
+        return this._getFlowMotionSpec({
+          ...geom.fallback,
+          reverse: Boolean(geom.reverse),
+        });
+      }
+      return null;
+    }
+
+    if (geom.mode === "quad") {
+      const { x0, y0, cx, cy, x1, y1, reverse } = geom;
+      if (![x0, y0, cx, cy, x1, y1].every((v) => Number.isFinite(v))) return null;
+      return {
+        offsetPath: `path("M ${x0} ${y0} Q ${cx} ${cy} ${x1} ${y1}")`,
+        reverse: Boolean(reverse),
+      };
+    }
+
+    const { x1, y1, x2, y2, reverse } = geom;
+    if (![x1, y1, x2, y2].every((v) => Number.isFinite(v))) return null;
+    return {
+      offsetPath: `path("M ${x1} ${y1} L ${x2} ${y2}")`,
+      reverse: Boolean(reverse),
+    };
+  }
+
+  _applyFlowAnimation(name, state) {
+    const dot = this.shadowRoot?.getElementById(`dot-${name}`);
+    if (!dot) return;
+
+    const motionSpec = this._getFlowMotionSpec(state?.geom);
+    if (!motionSpec) {
+      this._stopFlow(name);
+      return;
+    }
+
+    const now =
+      typeof performance !== "undefined" && typeof performance.now === "function"
+        ? performance.now()
+        : Date.now();
+    const duration = Number.isFinite(state?.duration) && state.duration > 0 ? state.duration : 1500;
+    const startedAt = Number.isFinite(state?.startedAt) ? state.startedAt : now;
+    const phase = duration > 0 ? Math.max(0, (now - startedAt) % duration) : 0;
+
+    state.startedAt = startedAt;
+    state.duration = duration;
+
+    dot.style.removeProperty("opacity");
+    dot.style.setProperty("offset-path", motionSpec.offsetPath);
+    dot.style.setProperty("offset-distance", motionSpec.reverse ? "100%" : "0%");
+    dot.style.setProperty("--cpc-flow-duration", `${duration}ms`);
+    dot.style.setProperty("--cpc-flow-start", motionSpec.reverse ? "100%" : "0%");
+    dot.style.setProperty("--cpc-flow-end", motionSpec.reverse ? "0%" : "100%");
+    dot.style.setProperty("animation-delay", `-${phase}ms`);
+    dot.classList.add("active");
+  }
+
   _startFlow(name, geom, duration) {
     if (!this._flowAnimations) this._flowAnimations = {};
 
     const existing = this._flowAnimations[name];
     if (existing && existing.active) {
       existing.geom = geom;
-      if (Number.isFinite(duration)) {
-        existing.pendingDuration = duration;
-      }
-      if (geom?.mode === "path") {
-        existing.pathEl = null;
-        existing.pathLength = 0;
-      }
+      if (Number.isFinite(duration) && duration > 0) existing.duration = duration;
+      this._applyFlowAnimation(name, existing);
       return;
     }
 
     const dot = this.shadowRoot.getElementById(`dot-${name}`);
     if (!dot) return;
-    dot.setAttribute("opacity", "1");
+    dot.style.removeProperty("opacity");
 
     const animState = {
       active: true,
-      frameId: null,
-      start: null,
+      startedAt:
+        typeof performance !== "undefined" && typeof performance.now === "function"
+          ? performance.now()
+          : Date.now(),
       geom,
-      duration,
-      pendingDuration: null,
-      lastPhase: 0,
-    };
-    if (name === "pv-home") {
-      animState.lockCXPercent = "50%";
-    }
-
-    const step = (timestamp) => {
-      if (!animState.active) return;
-      if (animState.start === null) animState.start = timestamp;
-
-      const d = animState.duration || 1500;
-      const elapsed = (timestamp - animState.start) % d;
-      const t = elapsed / d;
-      if (animState.pendingDuration != null && t < animState.lastPhase) {
-        animState.duration = animState.pendingDuration;
-        animState.pendingDuration = null;
-        animState.start = timestamp;
-      }
-      animState.lastPhase = t;
-      const fadeInEnd = 0.05;
-      const fadeOutStart = 0.85;
-      let opacity = 1;
-      if (t <= fadeInEnd) {
-        opacity = Math.min(1, t / fadeInEnd);
-      } else if (t >= fadeOutStart) {
-        opacity = Math.max(0, 1 - (t - fadeOutStart) / (1 - fadeOutStart));
-      }
-
-      let cx, cy;
-
-      if (animState.geom.mode === "quad") {
-        const { x0, y0, cx: qx, cy: qy, x1, y1 } = animState.geom;
-        const inv = 1 - t;
-        cx = inv * inv * x0 + 2 * inv * t * qx + t * t * x1;
-        cy = inv * inv * y0 + 2 * inv * t * qy + t * t * y1;
-      } else if (animState.geom.mode === "path") {
-        if (!animState.pathEl) {
-          animState.pathEl = this.shadowRoot?.getElementById(animState.geom.pathId);
-          animState.pathD = animState.pathEl?.getAttribute?.("d") || null;
-          animState.pathLength = animState.pathEl?.getTotalLength?.() || 0;
-        } else {
-          const nextD = animState.pathEl.getAttribute?.("d") || null;
-          if (nextD && nextD !== animState.pathD) {
-            animState.pathD = nextD;
-            animState.pathLength = animState.pathEl.getTotalLength?.() || 0;
-          }
-        }
-        if (animState.pathEl && animState.pathLength > 0) {
-          const pos = animState.geom.reverse ? 1 - t : t;
-          const pt = animState.pathEl.getPointAtLength(animState.pathLength * pos);
-          cx = pt.x;
-          cy = pt.y;
-        } else {
-          const { x1, y1, x2, y2 } = animState.geom.fallback || animState.geom;
-          const pos = animState.geom.reverse ? 1 - t : t;
-          cx = x1 + (x2 - x1) * pos;
-          cy = y1 + (y2 - y1) * pos;
-        }
-      } else {
-        const { x1, y1, x2, y2, reverse } = animState.geom;
-        const pos = reverse ? 1 - t : t;
-        cx = x1 + (x2 - x1) * pos;
-        cy = y1 + (y2 - y1) * pos;
-      }
-
-      if (animState.lockCXPercent) {
-        dot.setAttribute("cx", animState.lockCXPercent);
-      } else {
-        dot.setAttribute("cx", String(cx));
-      }
-      dot.setAttribute("cy", String(cy));
-      dot.setAttribute("opacity", opacity.toFixed(2));
-
-      animState.frameId = requestAnimationFrame(step);
+      duration: Number.isFinite(duration) && duration > 0 ? duration : 1500,
     };
 
-    animState.frameId = requestAnimationFrame(step);
     this._flowAnimations[name] = animState;
+    this._applyFlowAnimation(name, animState);
   }
 
   _stopFlow(name) {
     if (!this._flowAnimations || !this._flowAnimations[name]) return;
     const state = this._flowAnimations[name];
     state.active = false;
-    if (state.frameId) cancelAnimationFrame(state.frameId);
 
     const dot = this.shadowRoot.getElementById(`dot-${name}`);
-    if (dot) dot.setAttribute("opacity", "0");
+    if (dot) {
+      dot.classList.remove("active");
+      dot.style.removeProperty("offset-path");
+      dot.style.removeProperty("offset-distance");
+      dot.style.removeProperty("--cpc-flow-duration");
+      dot.style.removeProperty("--cpc-flow-start");
+      dot.style.removeProperty("--cpc-flow-end");
+      dot.style.removeProperty("animation-delay");
+      dot.style.setProperty("opacity", "0");
+    }
 
     delete this._flowAnimations[name];
   }
@@ -3978,17 +4009,17 @@ class CompactPowerCard extends (window.LitElement ||
           <path id="line-pv-battery" class="flow-line" fill="none" d="${pvBatteryPath}" />
           <path id="line-grid-home" class="flow-line" fill="none" d="${gridHomePath}" />
           <path id="line-home-battery" class="flow-line" fill="none" d="${batteryHomePath}" />
-          <circle id="dot-pv-home"      r="4" fill="${pvColor}" opacity="0" />
+          <circle id="dot-pv-home" class="flow-dot" r="4" fill="${pvColor}" opacity="0" />
           <path id="arc-grid-battery" class="flow-line" fill="none" d="${gridBatteryPath}" />
           <g id="device-lines"></g>
 
           <!-- Remaining flow dots -->
-          <circle id="dot-pv-grid"      r="4" fill="${pvColor}" opacity="0" />
-          <circle id="dot-pv-battery"   r="4" fill="${pvColor}" opacity="0" />
-          <circle id="dot-grid-home"    r="4" fill="${gridColor}" opacity="0" />
-          <circle id="dot-grid-battery" r="4" fill="${gridColor}" opacity="0" />
-          <circle id="dot-battery-home" r="4" fill="${pvInBatterySlot ? pvColor : batteryColor}" opacity="0" />
-          <circle id="dot-battery-grid" r="4" fill="${pvInBatterySlot ? pvColor : batteryColor}" opacity="0" />
+          <circle id="dot-pv-grid" class="flow-dot" r="4" fill="${pvColor}" opacity="0" />
+          <circle id="dot-pv-battery" class="flow-dot" r="4" fill="${pvColor}" opacity="0" />
+          <circle id="dot-grid-home" class="flow-dot" r="4" fill="${gridColor}" opacity="0" />
+          <circle id="dot-grid-battery" class="flow-dot" r="4" fill="${gridColor}" opacity="0" />
+          <circle id="dot-battery-home" class="flow-dot" r="4" fill="${pvInBatterySlot ? pvColor : batteryColor}" opacity="0" />
+          <circle id="dot-battery-grid" class="flow-dot" r="4" fill="${pvInBatterySlot ? pvColor : batteryColor}" opacity="0" />
 
           </svg>
           <div class="overlay">
