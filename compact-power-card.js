@@ -540,7 +540,7 @@ class CompactPowerCard extends (window.LitElement ||
   _scheduleUpdate() {
     if (this._updateTimeout) return;
     this._updateTimeout = setTimeout(() => {
-      this._updateFlows();
+      this._pendingFlowUpdate = true;
       this.requestUpdate();
       this._updateTimeout = null;
     }, 1000); // Throttle to 1 update per second
@@ -2444,7 +2444,7 @@ class CompactPowerCard extends (window.LitElement ||
 
   _updateFlows() {
     if (!this._config || !this.hass) return;
-    if (!this.shadowRoot) {
+    if (!this.shadowRoot || !this._layoutReady) {
       this._pendingFlowUpdate = true;
       return;
     }
@@ -3106,10 +3106,17 @@ class CompactPowerCard extends (window.LitElement ||
       const geomChanged = !this._flowGeomEquals(geom, existing.geom);
       const durationChanged = nextDuration !== existing.duration;
 
-      existing.pendingGeom = geomChanged ? geom : null;
-      existing.pendingDuration = durationChanged ? nextDuration : null;
-      this._syncFlowIterationHandler(existing);
-      return;
+      if (!geomChanged && !durationChanged) return;
+
+      if (geomChanged) {
+        // Path changed — stop and fall through to restart with correct geometry.
+        this._stopFlow(name);
+      } else {
+        // Duration-only change — queue for next iteration boundary.
+        existing.pendingDuration = nextDuration;
+        this._syncFlowIterationHandler(existing);
+        return;
+      }
     }
 
     const dot = this.shadowRoot.getElementById(`dot-${name}`);
