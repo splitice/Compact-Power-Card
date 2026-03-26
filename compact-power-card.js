@@ -3116,6 +3116,8 @@ class CompactPowerCard extends (window.LitElement ||
       pendingDuration: null,
       iterationHandler: null,
       iterationListening: false,
+      startFrame: null,
+      startFrameFollowup: null,
     };
 
     const iterationHandler = () => {
@@ -3129,15 +3131,26 @@ class CompactPowerCard extends (window.LitElement ||
 
     this._flowAnimations[name] = animState;
     this._commitFlowAnimation(name, animState);
-    // Force layout flush so the first cycle uses the newly applied motion path.
-    dot.getBoundingClientRect();
-    dot.classList.add("active");
+    if (this._flowAnimations[name] !== animState || !animState.active) return;
+    animState.startFrame = requestAnimationFrame(() => {
+      animState.startFrame = null;
+      animState.startFrameFollowup = requestAnimationFrame(() => {
+        animState.startFrameFollowup = null;
+        if (!animState.active || this._flowAnimations?.[name] !== animState) return;
+        dot.classList.add("active");
+        this._syncFlowIterationHandler(animState);
+      });
+    });
   }
 
   _stopFlow(name) {
     if (!this._flowAnimations || !this._flowAnimations[name]) return;
     const state = this._flowAnimations[name];
     state.active = false;
+    if (state.startFrame) cancelAnimationFrame(state.startFrame);
+    if (state.startFrameFollowup) cancelAnimationFrame(state.startFrameFollowup);
+    state.startFrame = null;
+    state.startFrameFollowup = null;
 
     const dot = state.dot || this.shadowRoot.getElementById(`dot-${name}`);
     if (dot) {
