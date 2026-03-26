@@ -540,7 +540,7 @@ class CompactPowerCard extends (window.LitElement ||
   _scheduleUpdate() {
     if (this._updateTimeout) return;
     this._updateTimeout = setTimeout(() => {
-      this._updateFlows();
+      this._pendingFlowUpdate = true;
       this.requestUpdate();
       this._updateTimeout = null;
     }, 1000); // Throttle to 1 update per second
@@ -2434,7 +2434,7 @@ class CompactPowerCard extends (window.LitElement ||
 
   _updateFlows() {
     if (!this._config || !this.hass) return;
-    if (!this.shadowRoot) {
+    if (!this.shadowRoot || !this._layoutReady) {
       this._pendingFlowUpdate = true;
       return;
     }
