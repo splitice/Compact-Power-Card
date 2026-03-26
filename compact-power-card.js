@@ -2962,6 +2962,24 @@ class CompactPowerCard extends (window.LitElement ||
     return Math.ceil(value / 100) * 100;
   }
 
+  _flowGeomEquals(a, b) {
+    if (a === b) return true;
+    if (!a || !b || a.mode !== b.mode || Boolean(a.reverse) !== Boolean(b.reverse)) return false;
+
+    if (a.mode === "path") {
+      return (
+        a.pathId === b.pathId &&
+        this._flowGeomEquals(a.fallback || null, b.fallback || null)
+      );
+    }
+
+    if (a.mode === "quad") {
+      return a.x0 === b.x0 && a.y0 === b.y0 && a.cx === b.cx && a.cy === b.cy && a.x1 === b.x1 && a.y1 === b.y1;
+    }
+
+    return a.x1 === b.x1 && a.y1 === b.y1 && a.x2 === b.x2 && a.y2 === b.y2;
+  }
+
   _hasPendingFlowDuration(state) {
     return Number.isFinite(state?.pendingDuration) && state.pendingDuration > 0;
   }
@@ -2998,10 +3016,12 @@ class CompactPowerCard extends (window.LitElement ||
 
     const existing = this._flowAnimations[name];
     if (existing && existing.active) {
-      existing.pendingGeom = geom;
-      if (Number.isFinite(duration) && duration > 0) {
-        existing.pendingDuration = this._normalizeFlowDuration(duration);
-      }
+      const nextDuration = this._normalizeFlowDuration(duration);
+      const geomChanged = !this._flowGeomEquals(geom, existing.geom);
+      const durationChanged = nextDuration !== existing.duration;
+
+      existing.pendingGeom = geomChanged ? geom : null;
+      existing.pendingDuration = durationChanged ? nextDuration : null;
       return;
     }
 
