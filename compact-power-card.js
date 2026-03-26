@@ -530,10 +530,19 @@ class CompactPowerCard extends (window.LitElement ||
   set hass(hass) {
     this._hass = hass;
     if (!this._config) return;
+    
     if (this._shouldUpdateForHass(hass)) {
+      this._scheduleUpdate(); 
+    }
+  }
+
+  _scheduleUpdate() {
+    if (this._updateTimeout) return;
+    this._updateTimeout = setTimeout(() => {
       this._updateFlows();
       this.requestUpdate();
-    }
+      this._updateTimeout = null;
+    }, 1000); // Throttle to 1 update per second
   }
 
   get hass() {
