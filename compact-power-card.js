@@ -2946,12 +2946,20 @@ class CompactPowerCard extends (window.LitElement ||
     if (!dot || !motionSpec) return;
     const start = motionSpec.reverse ? "100%" : "0%";
     const end = motionSpec.reverse ? "0%" : "100%";
+    const durationMs = `${duration}ms`;
     dot.style.removeProperty("opacity");
     dot.style.setProperty("offset-path", motionSpec.offsetPath);
     dot.style.setProperty("offset-distance", start);
-    dot.style.setProperty("--cpc-flow-duration", `${duration}ms`);
+    if (dot.style.getPropertyValue("--cpc-flow-duration") !== durationMs) {
+      dot.style.setProperty("--cpc-flow-duration", durationMs);
+    }
     dot.style.setProperty("--cpc-flow-start", start);
     dot.style.setProperty("--cpc-flow-end", end);
+  }
+
+  _normalizeFlowDuration(duration) {
+    const value = Number.isFinite(duration) && duration > 0 ? duration : 1500;
+    return Math.ceil(value / 100) * 100;
   }
 
   _hasPendingFlowDuration(state) {
@@ -2978,7 +2986,7 @@ class CompactPowerCard extends (window.LitElement ||
     }
 
     state.geom = nextGeom;
-    state.duration = Number.isFinite(nextDuration) && nextDuration > 0 ? nextDuration : 1500;
+    state.duration = this._normalizeFlowDuration(nextDuration);
     state.pendingGeom = null;
     state.pendingDuration = null;
 
@@ -2991,7 +2999,9 @@ class CompactPowerCard extends (window.LitElement ||
     const existing = this._flowAnimations[name];
     if (existing && existing.active) {
       existing.pendingGeom = geom;
-      if (Number.isFinite(duration) && duration > 0) existing.pendingDuration = duration;
+      if (Number.isFinite(duration) && duration > 0) {
+        existing.pendingDuration = this._normalizeFlowDuration(duration);
+      }
       return;
     }
 
@@ -3003,7 +3013,7 @@ class CompactPowerCard extends (window.LitElement ||
       active: true,
       dot,
       geom,
-      duration: Number.isFinite(duration) && duration > 0 ? duration : 1500,
+      duration: this._normalizeFlowDuration(duration),
       pendingGeom: null,
       pendingDuration: null,
       iterationHandler: null,
