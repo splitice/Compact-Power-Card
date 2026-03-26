@@ -1548,12 +1548,13 @@ class CompactPowerCard extends (window.LitElement ||
     svg.style.transform = "translateY(0px)";
 
     const viewBoxHeight = svg.viewBox?.baseVal?.height || 0;
-    const lineY = line.y1?.baseVal?.value;
-    if (!viewBoxHeight || lineY == null) return;
+    const lineY = line.y1?.baseVal?.value ?? null;
+    if (viewBoxHeight <= 0 || lineY == null) return;
 
     const headerBottom = header.offsetTop + header.offsetHeight;
     const svgTop = svg.offsetTop;
-    const lineTop = svgTop + (lineY / viewBoxHeight) * svg.clientHeight;
+    const linePixelOffset = (lineY / viewBoxHeight) * svg.clientHeight;
+    const lineTop = svgTop + linePixelOffset;
     const gap = lineTop - headerBottom;
 
     const desiredGap = 12;
