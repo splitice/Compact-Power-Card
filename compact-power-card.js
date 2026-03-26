@@ -505,6 +505,7 @@ class CompactPowerCard extends (window.LitElement ||
     super();
     this._hass = null;
     this._flowAnimations = {};
+    this._layoutMetricsCache = null;
     this._homeEffective = null;
     this._homeEffectiveUnit = "W";
     this._resizeObserver = null;
@@ -1260,6 +1261,19 @@ class CompactPowerCard extends (window.LitElement ||
       rawColumnSize > 0 && rawColumnSize <= 24
         ? rawColumnSize
         : Math.max(1, Math.round((outerWidth - padX) / (designWidth / 12)));
+    const layoutCacheKey = [
+      hasPv ? 1 : 0,
+      hasBattery ? 1 : 0,
+      hasAnyLabels ? 1 : 0,
+      useExternalHeight ? 1 : 0,
+      outerWidth,
+      outerHeight,
+      rawRowSize,
+      rawColumnSize,
+    ].join("|");
+    if (this._layoutMetricsCache?.key === layoutCacheKey) {
+      return this._layoutMetricsCache.value;
+    }
     let maxItemsByColumns = Math.max(1, Math.floor(columnCount / 1.5));
     if (baseWidth <= 430) {
       maxItemsByColumns = Math.min(maxItemsByColumns, 8);
@@ -1301,7 +1315,7 @@ class CompactPowerCard extends (window.LitElement ||
     const batteryNode = { x: gridLineEndX, y: gridNodeY };
     const homeNode = { x: homeCenterX, y: homeLineEndY };
 
-    return {
+    const layout = {
       designWidth,
       designHeight,
       defaultWidth,
@@ -1358,6 +1372,8 @@ class CompactPowerCard extends (window.LitElement ||
       batteryNode,
       homeNode,
     };
+    this._layoutMetricsCache = { key: layoutCacheKey, value: layout };
+    return layout;
   }
 
   _renderDeviceLines() {
@@ -2903,8 +2919,9 @@ class CompactPowerCard extends (window.LitElement ||
       .trim();
   }
 
-  _buildFlowMotionPath(geom) {
+  _buildFlowMotionPath(geom, reverseOverride = null) {
     if (!geom) return null;
+    const reverse = reverseOverride == null ? Boolean(geom.reverse) : reverseOverride;
 
     if (geom.mode === "path") {
       const pathId = geom.pathId || null;
@@ -2913,33 +2930,44 @@ class CompactPowerCard extends (window.LitElement ||
       if (pathData) {
         return {
           offsetPath: `path("${this._escapeMotionPathData(pathData)}")`,
-          reverse: Boolean(geom.reverse),
+          reverse,
         };
       }
       if (geom.fallback) {
-        return this._buildFlowMotionPath({
-          ...geom.fallback,
-          reverse: Boolean(geom.reverse),
-        });
+        return this._buildFlowMotionPath(geom.fallback, reverse);
       }
       return null;
     }
 
     if (geom.mode === "quad") {
-      const { x0, y0, cx, cy, x1, y1, reverse } = geom;
+      const { x0, y0, cx, cy, x1, y1 } = geom;
       if (!this._hasFiniteCoords([x0, y0, cx, cy, x1, y1])) return null;
       return {
         offsetPath: `path("M ${x0} ${y0} Q ${cx} ${cy} ${x1} ${y1}")`,
-        reverse: Boolean(reverse),
+        reverse,
       };
     }
 
-    const { x1, y1, x2, y2, reverse } = geom;
+    const { x1, y1, x2, y2 } = geom;
     if (!this._hasFiniteCoords([x1, y1, x2, y2])) return null;
     return {
       offsetPath: `path("M ${x1} ${y1} L ${x2} ${y2}")`,
-      reverse: Boolean(reverse),
+      reverse,
     };
+  }
+
+  _syncFlowIterationHandler(state) {
+    const dot = state?.dot;
+    const handler = state?.iterationHandler;
+    if (!dot || !handler) return;
+    const shouldListen = Boolean(state.active && this._hasPendingFlowUpdate(state));
+    if (shouldListen === Boolean(state.iterationListening)) return;
+    if (shouldListen) {
+      dot.addEventListener("animationiteration", handler);
+    } else {
+      dot.removeEventListener("animationiteration", handler);
+    }
+    state.iterationListening = shouldListen;
   }
 
   _setFlowAnimationStyles(dot, motionSpec, duration) {
@@ -2997,18 +3025,23 @@ class CompactPowerCard extends (window.LitElement ||
       this._hasPendingFlowDuration(state)
         ? state.pendingDuration
         : state?.duration;
-    const motionSpec = this._buildFlowMotionPath(nextGeom);
+    const motionSpec =
+      state?.pendingGeom || !state?.motionSpec
+        ? this._buildFlowMotionPath(nextGeom)
+        : state.motionSpec;
     if (!motionSpec) {
       this._stopFlow(name);
       return;
     }
 
     state.geom = nextGeom;
+    state.motionSpec = motionSpec;
     state.duration = this._normalizeFlowDuration(nextDuration);
     state.pendingGeom = null;
     state.pendingDuration = null;
 
     this._setFlowAnimationStyles(dot, motionSpec, state.duration);
+    this._syncFlowIterationHandler(state);
   }
 
   _startFlow(name, geom, duration) {
@@ -3022,6 +3055,7 @@ class CompactPowerCard extends (window.LitElement ||
 
       existing.pendingGeom = geomChanged ? geom : null;
       existing.pendingDuration = durationChanged ? nextDuration : null;
+      this._syncFlowIterationHandler(existing);
       return;
     }
 
@@ -3033,10 +3067,12 @@ class CompactPowerCard extends (window.LitElement ||
       active: true,
       dot,
       geom,
+      motionSpec: null,
       duration: this._normalizeFlowDuration(duration),
       pendingGeom: null,
       pendingDuration: null,
       iterationHandler: null,
+      iterationListening: false,
     };
 
     const iterationHandler = () => {
@@ -3044,11 +3080,9 @@ class CompactPowerCard extends (window.LitElement ||
       // Geometry and duration updates can be queued independently; duration-only
       // changes still wait for the next completed cycle to avoid mid-cycle jumps.
       if (!this._hasPendingFlowUpdate(animState)) return;
-      if (!animState.dot || !animState.dot.classList.contains("active")) return;
       this._commitFlowAnimation(name, animState);
     };
     animState.iterationHandler = iterationHandler;
-    dot.addEventListener("animationiteration", iterationHandler);
 
     this._flowAnimations[name] = animState;
     this._commitFlowAnimation(name, animState);
@@ -3063,6 +3097,7 @@ class CompactPowerCard extends (window.LitElement ||
     const dot = state.dot || this.shadowRoot.getElementById(`dot-${name}`);
     if (dot) {
       dot.removeEventListener("animationiteration", state.iterationHandler);
+      state.iterationListening = false;
       state.iterationHandler = null;
       dot.classList.remove("active");
       dot.style.removeProperty("offset-path");
