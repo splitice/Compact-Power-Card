@@ -3103,6 +3103,7 @@ class CompactPowerCard extends (window.LitElement ||
 
     this._flowAnimations[name] = animState;
     this._commitFlowAnimation(name, animState);
+    // Force layout flush so the first cycle uses the newly applied motion path.
     dot.getBoundingClientRect();
     dot.classList.add("active");
   }
