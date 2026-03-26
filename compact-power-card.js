@@ -3131,12 +3131,12 @@ class CompactPowerCard extends (window.LitElement ||
 
     this._flowAnimations[name] = animState;
     this._commitFlowAnimation(name, animState);
-    if (this._flowAnimations[name] !== animState || !animState.active) return;
     animState.startFrame = requestAnimationFrame(() => {
       animState.startFrame = null;
+      if (this._flowAnimations?.[name] !== animState || !animState.active) return;
       animState.startFrameFollowup = requestAnimationFrame(() => {
         animState.startFrameFollowup = null;
-        if (!animState.active || this._flowAnimations?.[name] !== animState) return;
+        if (this._flowAnimations?.[name] !== animState || !animState.active) return;
         dot.classList.add("active");
         this._syncFlowIterationHandler(animState);
       });
