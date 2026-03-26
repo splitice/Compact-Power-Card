@@ -2891,7 +2891,19 @@ class CompactPowerCard extends (window.LitElement ||
     }
   }
 
-  _getFlowMotionSpec(geom) {
+  _hasFiniteCoords(coords) {
+    return coords.every((v) => Number.isFinite(v));
+  }
+
+  _escapeMotionPathData(pathData) {
+    return String(pathData || "")
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  _buildFlowMotionPath(geom) {
     if (!geom) return null;
 
     if (geom.mode === "path") {
@@ -2900,12 +2912,12 @@ class CompactPowerCard extends (window.LitElement ||
       const pathData = pathEl?.getAttribute?.("d") || null;
       if (pathData) {
         return {
-          offsetPath: `path("${pathData.replace(/\s+/g, " ").trim()}")`,
+          offsetPath: `path("${this._escapeMotionPathData(pathData)}")`,
           reverse: Boolean(geom.reverse),
         };
       }
       if (geom.fallback) {
-        return this._getFlowMotionSpec({
+        return this._buildFlowMotionPath({
           ...geom.fallback,
           reverse: Boolean(geom.reverse),
         });
@@ -2915,7 +2927,7 @@ class CompactPowerCard extends (window.LitElement ||
 
     if (geom.mode === "quad") {
       const { x0, y0, cx, cy, x1, y1, reverse } = geom;
-      if (![x0, y0, cx, cy, x1, y1].every((v) => Number.isFinite(v))) return null;
+      if (!this._hasFiniteCoords([x0, y0, cx, cy, x1, y1])) return null;
       return {
         offsetPath: `path("M ${x0} ${y0} Q ${cx} ${cy} ${x1} ${y1}")`,
         reverse: Boolean(reverse),
@@ -2923,7 +2935,7 @@ class CompactPowerCard extends (window.LitElement ||
     }
 
     const { x1, y1, x2, y2, reverse } = geom;
-    if (![x1, y1, x2, y2].every((v) => Number.isFinite(v))) return null;
+    if (!this._hasFiniteCoords([x1, y1, x2, y2])) return null;
     return {
       offsetPath: `path("M ${x1} ${y1} L ${x2} ${y2}")`,
       reverse: Boolean(reverse),
@@ -2934,7 +2946,7 @@ class CompactPowerCard extends (window.LitElement ||
     const dot = this.shadowRoot?.getElementById(`dot-${name}`);
     if (!dot) return;
 
-    const motionSpec = this._getFlowMotionSpec(state?.geom);
+    const motionSpec = this._buildFlowMotionPath(state?.geom);
     if (!motionSpec) {
       this._stopFlow(name);
       return;
