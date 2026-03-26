@@ -3002,6 +3002,8 @@ class CompactPowerCard extends (window.LitElement ||
 
     const iterationHandler = () => {
       if (!animState.active) return;
+      const currentDot = this.shadowRoot?.getElementById(`dot-${name}`);
+      if (!currentDot || !currentDot.classList.contains("active")) return;
       if (animState.pendingGeom || Number.isFinite(animState.pendingDuration)) {
         this._commitFlowAnimation(name, animState);
       }
@@ -3023,6 +3025,7 @@ class CompactPowerCard extends (window.LitElement ||
     if (dot) {
       if (state.iterationHandler) {
         dot.removeEventListener("animationiteration", state.iterationHandler);
+        state.iterationHandler = null;
       }
       dot.classList.remove("active");
       dot.style.removeProperty("offset-path");
