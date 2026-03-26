@@ -2958,6 +2958,10 @@ class CompactPowerCard extends (window.LitElement ||
     return Number.isFinite(state?.pendingDuration) && state.pendingDuration > 0;
   }
 
+  _hasPendingFlowUpdate(state) {
+    return Boolean(state?.pendingGeom) || this._hasPendingFlowDuration(state);
+  }
+
   _commitFlowAnimation(name, state) {
     const dot = state?.dot || this.shadowRoot?.getElementById(`dot-${name}`);
     if (!dot) return;
@@ -3009,7 +3013,7 @@ class CompactPowerCard extends (window.LitElement ||
       if (!animState.active) return;
       // Geometry and duration updates can be queued independently; duration-only
       // changes still wait for the next completed cycle to avoid mid-cycle jumps.
-      if (!animState.pendingGeom && !this._hasPendingFlowDuration(animState)) return;
+      if (!this._hasPendingFlowUpdate(animState)) return;
       if (!animState.dot || !animState.dot.classList.contains("active")) return;
       this._commitFlowAnimation(name, animState);
     };
