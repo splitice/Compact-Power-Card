@@ -2959,7 +2959,7 @@ class CompactPowerCard extends (window.LitElement ||
   }
 
   _commitFlowAnimation(name, state) {
-    const dot = this.shadowRoot?.getElementById(`dot-${name}`);
+    const dot = state?.dot || this.shadowRoot?.getElementById(`dot-${name}`);
     if (!dot) return;
 
     const nextGeom = state?.pendingGeom || state?.geom;
@@ -2997,6 +2997,7 @@ class CompactPowerCard extends (window.LitElement ||
 
     const animState = {
       active: true,
+      dot,
       geom,
       duration: Number.isFinite(duration) && duration > 0 ? duration : 1500,
       pendingGeom: null,
@@ -3009,8 +3010,7 @@ class CompactPowerCard extends (window.LitElement ||
       // Geometry and duration updates can be queued independently; duration-only
       // changes still wait for the next completed cycle to avoid mid-cycle jumps.
       if (!animState.pendingGeom && !this._hasPendingFlowDuration(animState)) return;
-      const currentDot = this.shadowRoot?.getElementById(`dot-${name}`);
-      if (!currentDot || !currentDot.classList.contains("active")) return;
+      if (!animState.dot || !animState.dot.classList.contains("active")) return;
       this._commitFlowAnimation(name, animState);
     };
     animState.iterationHandler = iterationHandler;
@@ -3026,12 +3026,10 @@ class CompactPowerCard extends (window.LitElement ||
     const state = this._flowAnimations[name];
     state.active = false;
 
-    const dot = this.shadowRoot.getElementById(`dot-${name}`);
+    const dot = state.dot || this.shadowRoot.getElementById(`dot-${name}`);
     if (dot) {
-      if (state.iterationHandler) {
-        dot.removeEventListener("animationiteration", state.iterationHandler);
-        state.iterationHandler = null;
-      }
+      dot.removeEventListener("animationiteration", state.iterationHandler);
+      state.iterationHandler = null;
       dot.classList.remove("active");
       dot.style.removeProperty("offset-path");
       dot.style.removeProperty("offset-distance");
