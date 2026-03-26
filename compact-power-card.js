@@ -2921,7 +2921,10 @@ class CompactPowerCard extends (window.LitElement ||
 
   _buildFlowMotionPath(geom, reverseOverride = null) {
     if (!geom) return null;
-    const reverse = reverseOverride == null ? Boolean(geom.reverse) : reverseOverride;
+    const reverse =
+      reverseOverride === null || reverseOverride === undefined
+        ? Boolean(geom.reverse)
+        : reverseOverride;
 
     if (geom.mode === "path") {
       const pathId = geom.pathId || null;
@@ -2960,7 +2963,11 @@ class CompactPowerCard extends (window.LitElement ||
     const dot = state?.dot;
     const handler = state?.iterationHandler;
     if (!dot || !handler) return;
-    const shouldListen = Boolean(state.active && this._hasPendingFlowUpdate(state));
+    const shouldListen = Boolean(
+      state.active &&
+      dot.classList.contains("active") &&
+      this._hasPendingFlowUpdate(state)
+    );
     if (shouldListen === Boolean(state.iterationListening)) return;
     if (shouldListen) {
       dot.addEventListener("animationiteration", handler);
@@ -3025,8 +3032,9 @@ class CompactPowerCard extends (window.LitElement ||
       this._hasPendingFlowDuration(state)
         ? state.pendingDuration
         : state?.duration;
+    const hasPendingGeom = state?.pendingGeom !== null && state?.pendingGeom !== undefined;
     const motionSpec =
-      state?.pendingGeom || !state?.motionSpec
+      hasPendingGeom || !state?.motionSpec
         ? this._buildFlowMotionPath(nextGeom)
         : state.motionSpec;
     if (!motionSpec) {
