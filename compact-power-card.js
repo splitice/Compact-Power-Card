@@ -2954,13 +2954,17 @@ class CompactPowerCard extends (window.LitElement ||
     dot.style.setProperty("--cpc-flow-end", end);
   }
 
+  _hasPendingFlowDuration(state) {
+    return Number.isFinite(state?.pendingDuration) && state.pendingDuration > 0;
+  }
+
   _commitFlowAnimation(name, state) {
     const dot = this.shadowRoot?.getElementById(`dot-${name}`);
     if (!dot) return;
 
     const nextGeom = state?.pendingGeom || state?.geom;
     const nextDuration =
-      Number.isFinite(state?.pendingDuration) && state.pendingDuration > 0
+      this._hasPendingFlowDuration(state)
         ? state.pendingDuration
         : state?.duration;
     const motionSpec = this._buildFlowMotionPath(nextGeom);
@@ -3002,11 +3006,12 @@ class CompactPowerCard extends (window.LitElement ||
 
     const iterationHandler = () => {
       if (!animState.active) return;
+      // Geometry and duration updates can be queued independently; duration-only
+      // changes still wait for the next completed cycle to avoid mid-cycle jumps.
+      if (!animState.pendingGeom && !this._hasPendingFlowDuration(animState)) return;
       const currentDot = this.shadowRoot?.getElementById(`dot-${name}`);
       if (!currentDot || !currentDot.classList.contains("active")) return;
-      if (animState.pendingGeom || Number.isFinite(animState.pendingDuration)) {
-        this._commitFlowAnimation(name, animState);
-      }
+      this._commitFlowAnimation(name, animState);
     };
     animState.iterationHandler = iterationHandler;
     dot.addEventListener("animationiteration", iterationHandler);
