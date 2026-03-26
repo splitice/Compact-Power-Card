@@ -2942,35 +2942,39 @@ class CompactPowerCard extends (window.LitElement ||
     };
   }
 
-  _applyFlowAnimation(name, state) {
+  _setFlowAnimationStyles(dot, motionSpec, duration) {
+    if (!dot || !motionSpec) return;
+    const start = motionSpec.reverse ? "100%" : "0%";
+    const end = motionSpec.reverse ? "0%" : "100%";
+    dot.style.removeProperty("opacity");
+    dot.style.setProperty("offset-path", motionSpec.offsetPath);
+    dot.style.setProperty("offset-distance", start);
+    dot.style.setProperty("--cpc-flow-duration", `${duration}ms`);
+    dot.style.setProperty("--cpc-flow-start", start);
+    dot.style.setProperty("--cpc-flow-end", end);
+  }
+
+  _commitFlowAnimation(name, state) {
     const dot = this.shadowRoot?.getElementById(`dot-${name}`);
     if (!dot) return;
 
-    const motionSpec = this._buildFlowMotionPath(state?.geom);
+    const nextGeom = state?.pendingGeom || state?.geom;
+    const nextDuration =
+      Number.isFinite(state?.pendingDuration) && state.pendingDuration > 0
+        ? state.pendingDuration
+        : state?.duration;
+    const motionSpec = this._buildFlowMotionPath(nextGeom);
     if (!motionSpec) {
       this._stopFlow(name);
       return;
     }
 
-    const now =
-      typeof performance !== "undefined" && typeof performance.now === "function"
-        ? performance.now()
-        : Date.now();
-    const duration = Number.isFinite(state?.duration) && state.duration > 0 ? state.duration : 1500;
-    const startedAt = Number.isFinite(state?.startedAt) ? state.startedAt : now;
-    const phase = duration > 0 ? Math.max(0, (now - startedAt) % duration) : 0;
+    state.geom = nextGeom;
+    state.duration = Number.isFinite(nextDuration) && nextDuration > 0 ? nextDuration : 1500;
+    state.pendingGeom = null;
+    state.pendingDuration = null;
 
-    state.startedAt = startedAt;
-    state.duration = duration;
-
-    dot.style.removeProperty("opacity");
-    dot.style.setProperty("offset-path", motionSpec.offsetPath);
-    dot.style.setProperty("offset-distance", motionSpec.reverse ? "100%" : "0%");
-    dot.style.setProperty("--cpc-flow-duration", `${duration}ms`);
-    dot.style.setProperty("--cpc-flow-start", motionSpec.reverse ? "100%" : "0%");
-    dot.style.setProperty("--cpc-flow-end", motionSpec.reverse ? "0%" : "100%");
-    dot.style.setProperty("animation-delay", `-${phase}ms`);
-    dot.classList.add("active");
+    this._setFlowAnimationStyles(dot, motionSpec, state.duration);
   }
 
   _startFlow(name, geom, duration) {
@@ -2978,9 +2982,8 @@ class CompactPowerCard extends (window.LitElement ||
 
     const existing = this._flowAnimations[name];
     if (existing && existing.active) {
-      existing.geom = geom;
-      if (Number.isFinite(duration) && duration > 0) existing.duration = duration;
-      this._applyFlowAnimation(name, existing);
+      existing.pendingGeom = geom;
+      if (Number.isFinite(duration) && duration > 0) existing.pendingDuration = duration;
       return;
     }
 
@@ -2990,16 +2993,25 @@ class CompactPowerCard extends (window.LitElement ||
 
     const animState = {
       active: true,
-      startedAt:
-        typeof performance !== "undefined" && typeof performance.now === "function"
-          ? performance.now()
-          : Date.now(),
       geom,
       duration: Number.isFinite(duration) && duration > 0 ? duration : 1500,
+      pendingGeom: null,
+      pendingDuration: null,
+      iterationHandler: null,
     };
 
+    const iterationHandler = () => {
+      if (!animState.active) return;
+      if (animState.pendingGeom || Number.isFinite(animState.pendingDuration)) {
+        this._commitFlowAnimation(name, animState);
+      }
+    };
+    animState.iterationHandler = iterationHandler;
+    dot.addEventListener("animationiteration", iterationHandler);
+
     this._flowAnimations[name] = animState;
-    this._applyFlowAnimation(name, animState);
+    this._commitFlowAnimation(name, animState);
+    dot.classList.add("active");
   }
 
   _stopFlow(name) {
@@ -3009,13 +3021,15 @@ class CompactPowerCard extends (window.LitElement ||
 
     const dot = this.shadowRoot.getElementById(`dot-${name}`);
     if (dot) {
+      if (state.iterationHandler) {
+        dot.removeEventListener("animationiteration", state.iterationHandler);
+      }
       dot.classList.remove("active");
       dot.style.removeProperty("offset-path");
       dot.style.removeProperty("offset-distance");
       dot.style.removeProperty("--cpc-flow-duration");
       dot.style.removeProperty("--cpc-flow-start");
       dot.style.removeProperty("--cpc-flow-end");
-      dot.style.removeProperty("animation-delay");
       dot.style.setProperty("opacity", "0");
     }
 
