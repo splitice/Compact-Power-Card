@@ -514,6 +514,7 @@ class CompactPowerCard extends (window.LitElement ||
     this._externalHeight = null;
     this._deviceLines = [];
     this._deviceLineStates = new Map();
+    this._deviceLineElements = new Map();
     this._deviceLineFlickerTimer = null;
     this._labelFlickerStates = new Map();
     this._labelFlickerTimer = null;
@@ -1390,15 +1391,17 @@ class CompactPowerCard extends (window.LitElement ||
     if (!root) return;
     const group = root.getElementById("device-lines");
     if (!group) return;
-    group.innerHTML = "";
     const useDeviceLines = this._useDevicePowerLines();
     const lines = useDeviceLines && Array.isArray(this._deviceLines) ? this._deviceLines : [];
     if (!this._deviceLineStates) this._deviceLineStates = new Map();
+    if (!this._deviceLineElements) this._deviceLineElements = new Map();
     const now = Date.now();
     let nextFlickerEnd = null;
+    const allowGlow = this._allowGlowEffects();
     const ns = "http://www.w3.org/2000/svg";
-    for (const ln of lines) {
-      const path = document.createElementNS(ns, "path");
+    const desiredKeys = new Set();
+    lines.forEach((ln, index) => {
+      desiredKeys.add(ln.key);
       const state = this._deviceLineStates.get(ln.key) || {};
       const flickerUntil = state.flickerUntil || 0;
       const flicker = flickerUntil > now;
@@ -1415,26 +1418,49 @@ class CompactPowerCard extends (window.LitElement ||
           `Q${ln.startX} ${ln.downY} ${ln.startX + dir * cornerRadius} ${ln.downY} ` +
           `H${ln.homeX}`
         : `M${ln.startX} ${ln.startY} V${ln.downY} H${ln.homeX}`;
-      path.setAttribute(
-        "d",
-        d
-      );
-      path.setAttribute("fill", "none");
-      path.setAttribute("stroke", ln.color);
-      path.setAttribute(
-        "class",
-        `device-line${flicker ? " device-line-flicker" : ""}`
-      );
-      path.style.setProperty("--device-line-opacity", String(ln.opacity ?? 1));
-      path.setAttribute("stroke-width", "2");
-      path.setAttribute("stroke-linecap", "round");
-      path.setAttribute("vector-effect", "non-scaling-stroke");
-      if (ln.dashed && !flicker) {
-        path.setAttribute("stroke-dasharray", "1 3");
-      } else if (this._allowGlowEffects()) {
-        path.style.filter = `drop-shadow(0 0 6px ${ln.color})`;
+      const className = `device-line${flicker ? " device-line-flicker" : ""}`;
+      const opacity = String(ln.opacity ?? 1);
+      const dashArray = ln.dashed && !flicker ? "1 3" : "";
+      const filter = !dashArray && allowGlow ? `drop-shadow(0 0 6px ${ln.color})` : "";
+      const signature = [d, ln.color, className, opacity, dashArray, filter].join("|");
+      let path = this._deviceLineElements.get(ln.key) || null;
+      if (!path || path.parentNode !== group) {
+        path = document.createElementNS(ns, "path");
+        path.setAttribute("fill", "none");
+        path.setAttribute("stroke-width", "2");
+        path.setAttribute("stroke-linecap", "round");
+        path.setAttribute("vector-effect", "non-scaling-stroke");
+        path.dataset.deviceLineKey = String(ln.key);
+        this._deviceLineElements.set(ln.key, path);
       }
-      group.appendChild(path);
+      if (path.dataset.renderSignature !== signature) {
+        path.setAttribute("d", d);
+        path.setAttribute("stroke", ln.color);
+        path.setAttribute("class", className);
+        path.style.setProperty("--device-line-opacity", opacity);
+        if (dashArray) {
+          path.setAttribute("stroke-dasharray", dashArray);
+        } else {
+          path.removeAttribute("stroke-dasharray");
+        }
+        if (filter) {
+          path.style.filter = filter;
+        } else {
+          path.style.removeProperty("filter");
+        }
+        path.dataset.renderSignature = signature;
+      }
+      const currentNodeAtIndex = group.children[index] || null;
+      if (currentNodeAtIndex !== path) {
+        group.insertBefore(path, currentNodeAtIndex);
+      }
+    });
+    for (const [key, path] of Array.from(this._deviceLineElements.entries())) {
+      if (desiredKeys.has(key)) continue;
+      if (path?.parentNode === group) {
+        group.removeChild(path);
+      }
+      this._deviceLineElements.delete(key);
     }
     if (nextFlickerEnd == null) {
       for (const state of this._deviceLineStates.values()) {
