@@ -1234,20 +1234,27 @@ class CompactPowerCard extends (window.LitElement ||
     return Boolean(this.closest("div.card.fit-rows"));
   }
 
+  _getHostDimensions() {
+    return {
+      width: this._hostWidth ?? this.clientWidth ?? this.offsetWidth ?? 0,
+      height: this._hostHeight ?? this.clientHeight ?? this.offsetHeight ?? 0,
+    };
+  }
+
   _getLayoutMetrics({ hasPv, hasBattery, hasAnyLabels }) {
     const designWidth = 512;
     const designHeight = 184;
     const defaultWidth = 512;
     const useExternalHeight = this._shouldUseExternalHeight();
     const defaultHeight = !useExternalHeight && (!hasPv || !hasBattery) ? 150 : 184;
-    const hostRect = this.getBoundingClientRect ? this.getBoundingClientRect() : null;
-    const outerWidth = this._hostWidth != null ? this._hostWidth : hostRect?.width || defaultWidth;
+    const hostSize = this._getHostDimensions();
+    const outerWidth = hostSize.width || defaultWidth;
     const outerHeight = useExternalHeight
       ? this._externalHeight != null
         ? this._externalHeight
         : this._hostHeight != null
         ? this._hostHeight
-        : hostRect?.height || defaultHeight
+        : hostSize.height || defaultHeight
       : defaultHeight;
     const padX = 8; // ha-card left+right padding (4px each)
     const padY = 2; // bottom padding; top is 0
@@ -1330,7 +1337,6 @@ class CompactPowerCard extends (window.LitElement ||
       designHeight,
       defaultWidth,
       defaultHeight,
-      hostRect,
       outerWidth,
       outerHeight,
       padX,
@@ -1341,7 +1347,6 @@ class CompactPowerCard extends (window.LitElement ||
       renderScaleY,
       xScale,
       yScale,
-      hostRect,
       rowCount,
       columnCount,
       maxItemsByColumns,
@@ -1519,8 +1524,7 @@ class CompactPowerCard extends (window.LitElement ||
   }
 
   _updateScale() {
-    const rect = this.getBoundingClientRect ? this.getBoundingClientRect() : null;
-    const hostWidth = this._hostWidth != null ? this._hostWidth : rect?.width || 0;
+    const hostWidth = this._getHostDimensions().width;
     if (!hostWidth || hostWidth < 200) {
       this.style.setProperty("--cpc-scale", "1");
       return;
@@ -1543,9 +1547,15 @@ class CompactPowerCard extends (window.LitElement ||
     svg.style.marginTop = "0px";
     svg.style.transform = "translateY(0px)";
 
-    const headerBox = header.getBoundingClientRect();
-    const lineBox = line.getBoundingClientRect();
-    const gap = lineBox.top - headerBox.bottom;
+    const viewBoxHeight = svg.viewBox?.baseVal?.height || 0;
+    const lineY = line.y1?.baseVal?.value ?? null;
+    if (viewBoxHeight <= 0 || lineY == null) return;
+
+    const headerBottom = header.offsetTop + header.offsetHeight;
+    const svgTop = svg.offsetTop;
+    const linePixelOffset = (lineY / viewBoxHeight) * svg.clientHeight;
+    const lineTop = svgTop + linePixelOffset;
+    const gap = lineTop - headerBottom;
 
     const desiredGap = 12;
     const delta = gap - desiredGap;
@@ -3271,7 +3281,6 @@ class CompactPowerCard extends (window.LitElement ||
       renderScaleY,
       xScale,
       yScale,
-      hostRect,
       rowCount,
       columnCount,
       maxItemsByColumns,
