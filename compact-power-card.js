@@ -506,6 +506,7 @@ class CompactPowerCard extends (window.LitElement ||
     this._hass = null;
     this._flowAnimations = {};
     this._layoutMetricsCache = null;
+    this._flowGeometryCache = null;
     this._homeEffective = null;
     this._homeEffectiveUnit = "W";
     this._resizeObserver = null;
@@ -518,6 +519,7 @@ class CompactPowerCard extends (window.LitElement ||
     this._deviceLineFlickerTimer = null;
     this._labelFlickerStates = new Map();
     this._labelFlickerTimer = null;
+    this._trackedEntities = [];
     this._trackedEntityIds = new Set();
     this._lastEntityStates = new Map();
     this._lastThemeMode = null;
@@ -526,6 +528,19 @@ class CompactPowerCard extends (window.LitElement ||
     this._pendingFlowUpdate = false;
     this._lastFlowLayoutKey = null;
     this._layoutReady = false;
+    this._lastLayoutProbeKey = null;
+    this._lastAdjustLayoutKey = null;
+    this._deviceLinesSignature = "";
+    this._lastDeviceLinesSignature = null;
+    this._renderedDeviceLinesSignature = null;
+    this._lineStyleCache = new Map();
+    this._loafObserver = null;
+    this._loafSupported = false;
+    this._loafSamples = [];
+    this._reducedPerformanceActive = false;
+    this._reducedPerformanceUntil = 0;
+    this._reducedPerformanceTimer = null;
+    this._lastReducedPerformanceReason = null;
   }
 
   set hass(hass) {
@@ -566,9 +581,13 @@ class CompactPowerCard extends (window.LitElement ||
       ? Math.min(2.0, Math.max(0.5, fontScaleRaw))
       : 1;
     this.style.setProperty("--cpc-text-scale", String(fontScale));
+    this._trackedEntities = this._collectTrackedEntities();
     this._trackedEntityIds = this._collectEntityIds();
     this._lastEntityStates.clear();
     this._lastThemeMode = null;
+    this._layoutMetricsCache = null;
+    this._flowGeometryCache = null;
+    this._lineStyleCache.clear();
   }
 
   static get styles() {
@@ -1191,12 +1210,22 @@ class CompactPowerCard extends (window.LitElement ||
 
   updated(changedProps) {
     if (super.updated) super.updated(changedProps);
-    this._adjustLayout();
-    this._renderDeviceLines();
     this._logLayoutSizes();
-    const layoutKey = `${this._hostWidth ?? 0}x${this._hostHeight ?? 0}x${this._externalHeight ?? 0}`;
+    const layoutProbeKey = `${this._hostWidth ?? 0}x${this._hostHeight ?? 0}x${this._externalHeight ?? 0}`;
+    this._lastLayoutProbeKey = layoutProbeKey;
+    const layoutKey = `${layoutProbeKey}|${this._lastColumnSize ?? 0}x${this._lastRowSize ?? 0}`;
+    if (layoutKey !== this._lastAdjustLayoutKey) {
+      this._lastAdjustLayoutKey = layoutKey;
+      this._adjustLayout();
+    }
+    const deviceRenderKey = `${layoutKey}|${this._deviceLinesSignature}`;
+    if (deviceRenderKey !== this._lastDeviceLinesSignature) {
+      this._renderDeviceLines();
+      this._lastDeviceLinesSignature = deviceRenderKey;
+    }
     if (layoutKey !== this._lastFlowLayoutKey) {
       this._lastFlowLayoutKey = layoutKey;
+      this._pendingFlowUpdate = false;
       this._updateFlows();
     }
     if (this._pendingFlowUpdate && this.shadowRoot) {
@@ -1391,6 +1420,114 @@ class CompactPowerCard extends (window.LitElement ||
     return layout;
   }
 
+  _getFlowGeometry(layout, curveFactor = this._getCurveFactor()) {
+    const key = `${this._layoutMetricsCache?.key || "layout"}|${curveFactor}`;
+    if (this._flowGeometryCache?.key === key) {
+      return this._flowGeometryCache.value;
+    }
+
+    const {
+      homeCenterX,
+      pvNode,
+      gridNode,
+      batteryNode,
+      homeNode,
+      gridLineStartX,
+      gridPvStartY,
+      pvGridEndX,
+      pvBatteryStartX,
+      pvBatteryEndY,
+      gridHomeStartY,
+      gridHomeEndX,
+      batteryHomeStartY,
+      batteryHomeEndX,
+      humpStartX,
+      humpCtrlInX,
+      humpPeakY,
+      humpCtrlOutX,
+      humpEndX,
+      pvGridTurnRadius,
+    } = layout;
+
+    const curvedLines = curveFactor > 0;
+    const curveScale = curvedLines ? (curveFactor - 1) / 4 : 0;
+    const cornerBaseRadius = pvGridTurnRadius;
+
+    const makeCornerPath = (startX, startY, endX, endY, sweepFlag, firstAxis = "H") => {
+      if (!curvedLines) {
+        return firstAxis === "H"
+          ? `M${startX} ${startY} H${endX} V${endY}`
+          : `M${startX} ${startY} V${endY} H${endX}`;
+      }
+
+      const spanX = Math.abs(endX - startX);
+      const spanY = Math.abs(endY - startY);
+      const cornerX = firstAxis === "H" ? endX : startX;
+      const cornerY = firstAxis === "H" ? startY : endY;
+
+      if (curveFactor >= 5) {
+        return `M${startX} ${startY} Q${cornerX} ${cornerY} ${endX} ${endY}`;
+      }
+
+      const maxInset = Math.min(spanX, spanY);
+      const inset = cornerBaseRadius + (maxInset - cornerBaseRadius) * curveScale;
+      const r = inset;
+
+      if (firstAxis === "H") {
+        const horizEnd = endX > startX ? endX - inset : endX + inset;
+        const arcEndY = endY > startY ? startY + inset : startY - inset;
+        return `M${startX} ${startY} H${horizEnd} A${r} ${r} 0 0 ${sweepFlag} ${endX} ${arcEndY} V${endY}`;
+      }
+
+      const vertEnd = endY > startY ? endY - inset : endY + inset;
+      const arcEndX = endX > startX ? startX + inset : startX - inset;
+      return `M${startX} ${startY} V${vertEnd} A${r} ${r} 0 0 ${sweepFlag} ${arcEndX} ${endY} H${endX}`;
+    };
+
+    const linePathData = (x1, y1, x2, y2) => `M ${x1} ${y1} L ${x2} ${y2}`;
+    const motionGeom = (pathData, reverse = false) => ({
+      mode: "pathData",
+      pathData,
+      reverse,
+    });
+
+    const pvGridPath = makeCornerPath(gridLineStartX, gridPvStartY, pvGridEndX, pvNode.y, 0, "H");
+    const pvBatteryPath = makeCornerPath(pvBatteryStartX, pvNode.y, batteryNode.x, pvBatteryEndY, 0, "V");
+    const gridHomePath = makeCornerPath(gridNode.x, gridHomeStartY, gridHomeEndX, homeNode.y, 1, "H");
+    const batteryHomePath = makeCornerPath(batteryNode.x, batteryHomeStartY, batteryHomeEndX, homeNode.y, 0, "H");
+    const gridBatteryPath = curvedLines
+      ? `M${gridNode.x} ${gridNode.y} H${humpStartX} Q${humpCtrlInX} ${humpPeakY} ${homeCenterX} ${humpPeakY} Q${humpCtrlOutX} ${humpPeakY} ${humpEndX} ${gridNode.y} H${batteryNode.x}`
+      : `M${gridNode.x} ${gridNode.y} H${batteryNode.x}`;
+    const pvHomePath = linePathData(pvNode.x, pvNode.y, homeNode.x, homeNode.y);
+
+    const value = {
+      curvedLines,
+      pvGridPath,
+      pvBatteryPath,
+      gridHomePath,
+      batteryHomePath,
+      gridBatteryPath,
+      pvHomeLine: {
+        x1: pvNode.x,
+        y1: pvNode.y,
+        x2: homeNode.x,
+        y2: homeNode.y,
+      },
+      geom: {
+        "pv-grid": motionGeom(pvGridPath, true),
+        "pv-home": motionGeom(pvHomePath),
+        "pv-battery": motionGeom(pvBatteryPath),
+        "grid-home": motionGeom(gridHomePath),
+        "battery-home": motionGeom(batteryHomePath),
+        "grid-battery": motionGeom(gridBatteryPath),
+        "battery-grid": motionGeom(gridBatteryPath, true),
+      },
+    };
+
+    this._flowGeometryCache = { key, value };
+    return value;
+  }
+
   _renderDeviceLines() {
     const root = this.shadowRoot;
     if (!root) return;
@@ -1403,14 +1540,15 @@ class CompactPowerCard extends (window.LitElement ||
     const now = Date.now();
     let nextFlickerEnd = null;
     const allowGlow = this._allowGlowEffects();
+    const reducedPerformanceActive = this._isReducedPerformanceActive();
     const ns = "http://www.w3.org/2000/svg";
     const desiredKeys = new Set();
-    lines.forEach((ln, index) => {
+    const lineMetas = lines.map((ln, index) => {
       desiredKeys.add(ln.key);
       const state = this._deviceLineStates.get(ln.key) || {};
       const flickerUntil = state.flickerUntil || 0;
-      const flicker = flickerUntil > now;
-      if (flickerUntil > now) {
+      const flicker = !reducedPerformanceActive && flickerUntil > now;
+      if (!reducedPerformanceActive && flickerUntil > now) {
         nextFlickerEnd = nextFlickerEnd == null ? flickerUntil : Math.min(nextFlickerEnd, flickerUntil);
       }
       const horizDist = Math.abs(ln.homeX - ln.startX);
@@ -1427,7 +1565,25 @@ class CompactPowerCard extends (window.LitElement ||
       const opacity = String(ln.opacity ?? 1);
       const dashArray = ln.dashed && !flicker ? "1 3" : "";
       const filter = !dashArray && allowGlow ? `drop-shadow(0 0 6px ${ln.color})` : "";
-      const signature = [d, ln.color, className, opacity, dashArray, filter].join("|");
+      const signature = [ln.key, d, ln.color, className, opacity, dashArray, filter].join("|");
+      return { index, ln, d, className, opacity, dashArray, filter, signature };
+    });
+
+    const renderSignature = [
+      reducedPerformanceActive ? 1 : 0,
+      allowGlow ? 1 : 0,
+      lineMetas.map((meta) => meta.signature).join("||"),
+    ].join("|");
+    if (
+      renderSignature === this._renderedDeviceLinesSignature &&
+      this._deviceLineElements.size === lineMetas.length &&
+      !nextFlickerEnd
+    ) {
+      return;
+    }
+
+    lineMetas.forEach((meta) => {
+      const { index, ln, d, className, opacity, dashArray, filter, signature } = meta;
       let path = this._deviceLineElements.get(ln.key) || null;
       if (!path || path.parentNode !== group) {
         path = document.createElementNS(ns, "path");
@@ -1467,7 +1623,7 @@ class CompactPowerCard extends (window.LitElement ||
       }
       this._deviceLineElements.delete(key);
     }
-    if (nextFlickerEnd == null) {
+    if (!reducedPerformanceActive && nextFlickerEnd == null) {
       for (const state of this._deviceLineStates.values()) {
         const flickerUntil = state?.flickerUntil || 0;
         if (flickerUntil > now) {
@@ -1482,7 +1638,11 @@ class CompactPowerCard extends (window.LitElement ||
         this._deviceLineFlickerTimer = null;
         this.requestUpdate();
       }, delay);
+    } else if (this._deviceLineFlickerTimer) {
+      clearTimeout(this._deviceLineFlickerTimer);
+      this._deviceLineFlickerTimer = null;
     }
+    this._renderedDeviceLinesSignature = renderSignature;
   }
 
   connectedCallback() {
@@ -1511,6 +1671,7 @@ class CompactPowerCard extends (window.LitElement ||
       });
     }
     this._resizeObserver.observe(this);
+    this._setupLoafObserver();
     this._updateScale();
   }
 
@@ -1519,6 +1680,30 @@ class CompactPowerCard extends (window.LitElement ||
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;
+    }
+    if (this._loafObserver) {
+      this._loafObserver.disconnect();
+      this._loafObserver = null;
+    }
+    if (this._updateTimeout) {
+      clearTimeout(this._updateTimeout);
+      this._updateTimeout = null;
+    }
+    if (this._deviceLineFlickerTimer) {
+      clearTimeout(this._deviceLineFlickerTimer);
+      this._deviceLineFlickerTimer = null;
+    }
+    if (this._labelFlickerTimer) {
+      clearTimeout(this._labelFlickerTimer);
+      this._labelFlickerTimer = null;
+    }
+    if (this._reducedPerformanceTimer) {
+      clearTimeout(this._reducedPerformanceTimer);
+      this._reducedPerformanceTimer = null;
+    }
+    if (this._homeGradientFrame) {
+      cancelAnimationFrame(this._homeGradientFrame);
+      this._homeGradientFrame = null;
     }
     super.disconnectedCallback();
   }
@@ -1633,6 +1818,103 @@ class CompactPowerCard extends (window.LitElement ||
       .filter(Boolean);
   }
 
+  _setupLoafObserver() {
+    const supportedTypes = window?.PerformanceObserver?.supportedEntryTypes;
+    this._loafSupported = Array.isArray(supportedTypes) && supportedTypes.includes("long-animation-frame");
+    if (!this._loafSupported || this._loafObserver) return;
+    try {
+      this._loafObserver = new PerformanceObserver((list) => {
+        this._handleLoafEntries(list.getEntries());
+      });
+      this._loafObserver.observe({ type: "long-animation-frame" });
+    } catch (_err) {
+      this._loafSupported = false;
+      this._loafObserver = null;
+    }
+  }
+
+  _handleLoafEntries(entries) {
+    if (!Array.isArray(entries) || !entries.length) return;
+    const now = performance.now();
+    let hasQualifyingEntry = false;
+    for (const entry of entries) {
+      if (!entry || !Number.isFinite(entry.duration) || entry.duration <= 75) continue;
+      this._loafSamples.push(now);
+      hasQualifyingEntry = true;
+    }
+    if (!hasQualifyingEntry) return;
+    this._pruneLoafSamples(now);
+    if (this._reducedPerformanceActive) {
+      this._extendReducedPerformance(now);
+      return;
+    }
+    if (this._loafSamples.length >= 3) {
+      this._activateReducedPerformance(now);
+    }
+  }
+
+  _pruneLoafSamples(now = performance.now()) {
+    const cutoff = now - 15000;
+    this._loafSamples = this._loafSamples.filter((stamp) => Number.isFinite(stamp) && stamp >= cutoff);
+  }
+
+  _activateReducedPerformance(now = performance.now()) {
+    this._reducedPerformanceActive = true;
+    this._lastReducedPerformanceReason = "loaf";
+    this._extendReducedPerformance(now);
+    this.classList.toggle("reduced-performance", true);
+    this._pendingFlowUpdate = true;
+    this.requestUpdate();
+  }
+
+  _extendReducedPerformance(now = performance.now()) {
+    const nextUntil = now + 30000;
+    this._reducedPerformanceUntil = Math.max(this._reducedPerformanceUntil || 0, nextUntil);
+    this._scheduleReducedPerformanceReevaluation(now);
+  }
+
+  _scheduleReducedPerformanceReevaluation(now = performance.now()) {
+    if (this._reducedPerformanceTimer) {
+      clearTimeout(this._reducedPerformanceTimer);
+      this._reducedPerformanceTimer = null;
+    }
+    if (!this._reducedPerformanceActive || !Number.isFinite(this._reducedPerformanceUntil)) return;
+    const delay = Math.max(0, this._reducedPerformanceUntil - now);
+    this._reducedPerformanceTimer = setTimeout(() => {
+      this._reducedPerformanceTimer = null;
+      this._reevaluateReducedPerformance();
+    }, delay);
+  }
+
+  _reevaluateReducedPerformance() {
+    const now = performance.now();
+    this._pruneLoafSamples(now);
+    if (this._loafSamples.length >= 3) {
+      this._reducedPerformanceUntil = now + 30000;
+      this._scheduleReducedPerformanceReevaluation(now);
+      return;
+    }
+    this._clearReducedPerformance();
+  }
+
+  _clearReducedPerformance() {
+    if (!this._reducedPerformanceActive) return;
+    this._reducedPerformanceActive = false;
+    this._reducedPerformanceUntil = 0;
+    this._lastReducedPerformanceReason = null;
+    if (this._reducedPerformanceTimer) {
+      clearTimeout(this._reducedPerformanceTimer);
+      this._reducedPerformanceTimer = null;
+    }
+    this.classList.toggle("reduced-performance", false);
+    this._pendingFlowUpdate = true;
+    this.requestUpdate();
+  }
+
+  _isReducedPerformanceActive() {
+    return this._reducedPerformanceActive === true;
+  }
+
   _coerceBoolean(val, defaultVal = false) {
     if (val === undefined || val === null) return defaultVal;
     if (typeof val === "string") {
@@ -1660,21 +1942,26 @@ class CompactPowerCard extends (window.LitElement ||
     return null;
   }
 
-  _collectEntityIds() {
-    const ids = new Set();
-    const ents = this._config?.entities || {};
-    const add = (id) => {
-      if (id) ids.add(id);
+  _collectTrackedEntities() {
+    const tracked = [];
+    const seen = new Set();
+    const add = (entityId, attribute = null) => {
+      if (!entityId) return;
+      const key = `${entityId}|${attribute || ""}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      tracked.push({ key, entityId, attribute: attribute || null });
     };
-    const addEntityConfig = (cfg) => {
+    const addEntityConfig = (cfg, attribute = null) => {
       if (!cfg) return;
       if (Array.isArray(cfg)) {
-        cfg.forEach(addEntityConfig);
+        cfg.forEach((item) => addEntityConfig(item, attribute));
         return;
       }
-      add(this._extractEntityRef(cfg));
+      add(this._extractEntityRef(cfg), attribute);
     };
 
+    const ents = this._config?.entities || {};
     addEntityConfig(ents.pv);
     addEntityConfig(ents.grid);
     addEntityConfig(ents.home);
@@ -1689,9 +1976,9 @@ class CompactPowerCard extends (window.LitElement ||
       : ents.battery?.labels;
     const batteryLabels = this._normalizeLabels(batteryLabelsSource, null);
 
-    pvLabels.forEach((lbl) => add(this._extractEntityRef(lbl?.entity)));
-    gridLabels.forEach((lbl) => add(this._extractEntityRef(lbl?.entity)));
-    batteryLabels.forEach((lbl) => add(this._extractEntityRef(lbl?.entity)));
+    pvLabels.forEach((lbl) => add(this._extractEntityRef(lbl?.entity), lbl?.attribute || null));
+    gridLabels.forEach((lbl) => add(this._extractEntityRef(lbl?.entity), lbl?.attribute || null));
+    batteryLabels.forEach((lbl) => add(this._extractEntityRef(lbl?.entity), lbl?.attribute || null));
 
     const batteryList = Array.isArray(ents.battery)
       ? ents.battery
@@ -1701,24 +1988,38 @@ class CompactPowerCard extends (window.LitElement ||
     for (const cfg of batteryList) {
       add(this._extractEntityRef(cfg?.charge_entity || cfg?.chargeEntity));
       add(this._extractEntityRef(cfg?.discharge_entity || cfg?.dischargeEntity));
-      const socRef =
-        this._extractEntityRef(cfg?.battery_soc) ||
-        this._extractEntityRef(cfg?.soc) ||
-        this._extractEntityRef(cfg?.soc_entity) ||
-        this._extractEntityRef(cfg?.battery_soc_entity) ||
-        this._extractEntityRef(cfg?.battery_soc_id) ||
-        this._extractEntityRef(cfg?.soc_entity_id);
-      add(socRef);
+      const socRef = this._getBatterySocRef(cfg);
+      add(socRef?.entity || null, socRef?.attribute || null);
     }
 
     const { sources } = this._getSourcesConfig();
     sources.forEach((src) => {
-      add(this._extractEntityRef(src?.entity));
+      add(this._extractEntityRef(src?.entity), src?.attribute || null);
       add(this._extractEntityRef(src?.switch_entity));
       add(this._extractEntityRef(src?.name));
     });
 
-    return ids;
+    return tracked;
+  }
+
+  _collectEntityIds() {
+    return new Set((this._trackedEntities || []).map((ref) => ref.entityId).filter(Boolean));
+  }
+
+  _getTrackedEntityStamp(ref, hass) {
+    const entityId = ref?.entityId || null;
+    if (!entityId) return "missing";
+    const st = hass?.states?.[entityId];
+    if (!st) return "missing";
+    const attrName = ref?.attribute || null;
+    const visibleValue = attrName ? st.attributes?.[attrName] : st.state;
+    return JSON.stringify([
+      visibleValue ?? null,
+      st.state ?? null,
+      st.attributes?.unit_of_measurement ?? "",
+      st.attributes?.icon ?? "",
+      st.attributes?.device_class ?? "",
+    ]);
   }
 
   _shouldUpdateForHass(hass) {
@@ -1728,23 +2029,23 @@ class CompactPowerCard extends (window.LitElement ||
       return true;
     }
 
-    const ids = this._trackedEntityIds || new Set();
-    if (!ids.size) return true;
+    const tracked = this._trackedEntities || [];
+    if (!tracked.length) return true;
 
     let changed = false;
-    for (const id of ids) {
-      const st = hass?.states?.[id];
-      const stamp = st ? `${st.last_changed}|${st.last_updated}` : "missing";
-      const prev = this._lastEntityStates.get(id);
+    for (const ref of tracked) {
+      const stamp = this._getTrackedEntityStamp(ref, hass);
+      const prev = this._lastEntityStates.get(ref.key);
       if (prev !== stamp) {
-        this._lastEntityStates.set(id, stamp);
+        this._lastEntityStates.set(ref.key, stamp);
         changed = true;
       }
     }
     if (!changed) return false;
 
-    for (const id of Array.from(this._lastEntityStates.keys())) {
-      if (!ids.has(id)) this._lastEntityStates.delete(id);
+    const validKeys = new Set(tracked.map((ref) => ref.key));
+    for (const key of Array.from(this._lastEntityStates.keys())) {
+      if (!validKeys.has(key)) this._lastEntityStates.delete(key);
     }
     return true;
   }
@@ -2269,10 +2570,15 @@ class CompactPowerCard extends (window.LitElement ||
   _setLineColor(lineId, color, active = false) {
     const el = this.shadowRoot?.getElementById(lineId);
     if (!el) return;
-    el.style.stroke = color;
-    el.style.strokeOpacity = active ? "1" : "0.15";
     const allowGlow = this._allowGlowEffects();
-    el.style.filter = active && allowGlow ? `drop-shadow(0 0 6px ${color})` : "none";
+    const strokeOpacity = active ? "1" : "0.15";
+    const filter = active && allowGlow ? `drop-shadow(0 0 6px ${color})` : "none";
+    const signature = `${color}|${strokeOpacity}|${filter}`;
+    if (this._lineStyleCache.get(lineId) === signature) return;
+    el.style.stroke = color;
+    el.style.strokeOpacity = strokeOpacity;
+    el.style.filter = filter;
+    this._lineStyleCache.set(lineId, signature);
   }
 
   _setHomeGradient(pvToHome, batteryToHome, gridToHome, pvColor, batteryColor, gridColor, homeColor) {
@@ -2606,28 +2912,6 @@ class CompactPowerCard extends (window.LitElement ||
     const gridImportThreshold = 0;
     const baseDuration = 1500;
 
-    const parseLineGeom = (id, fallback, reverse = false) => {
-      const el = this.shadowRoot?.getElementById(id);
-      if (!el) return fallback;
-      const x1 = Number(el.getAttribute("x1"));
-      const y1 = Number(el.getAttribute("y1"));
-      const x2 = Number(el.getAttribute("x2"));
-      const y2 = Number(el.getAttribute("y2"));
-      if ([x1, y1, x2, y2].every((v) => Number.isFinite(v))) {
-        if (reverse) {
-          return { mode: "line", x1: x2, y1: y2, x2: x1, y2: y1 };
-        }
-        return { mode: "line", x1, y1, x2, y2 };
-      }
-      return fallback;
-    };
-
-    const parsePathGeom = (id, fallback, reverse = false) => {
-      const el = this.shadowRoot?.getElementById(id);
-      if (!el || !el.getTotalLength) return fallback;
-      return { mode: "path", pathId: id, fallback, reverse };
-    };
-
     const allLines = [
       "line-pv-grid",
       "line-pv-home",
@@ -2657,144 +2941,8 @@ class CompactPowerCard extends (window.LitElement ||
       hasBattery,
       hasAnyLabels,
     });
-    const {
-      baseWidth,
-      renderScaleY,
-      homeCenterX,
-      pvNodeY,
-      homeAnchorY,
-      homeLineEndY,
-      gridLineStartX,
-      gridLineEndX,
-      gridNodeY,
-      gridPvStartY,
-      humpWidth,
-      humpHeightAdj,
-      humpStartX,
-      humpEndX,
-      humpPeakY,
-      humpCtrlInX,
-      humpCtrlOutX,
-      pvGridEndX,
-      pvGridTurnRadius,
-      pvBatteryStartX,
-      pvBatteryEndY,
-      gridHomeStartY,
-      gridHomeEndX,
-      batteryHomeStartY,
-      batteryHomeEndX,
-      pvNode,
-      gridNode,
-      batteryNode,
-      homeNode,
-    } = layout;
-    const gridBatteryCtrlX = baseWidth / 2; // keep hump centered near home/PV line
-    const gridBatteryCtrlY = gridNodeY - humpHeightAdj; // fixed hump height (screen px)
-
-    // Straight-line geometry between anchor points
-    const gridBatteryGeom = curvedLines
-      ? {
-          mode: "path",
-          pathId: "arc-grid-battery",
-          fallback: { mode: "line", x1: gridNode.x, y1: gridNode.y, x2: batteryNode.x, y2: batteryNode.y },
-          ctrlX: gridBatteryCtrlX,
-          ctrlY: gridBatteryCtrlY,
-        }
-      : { mode: "line", x1: gridNode.x, y1: gridNode.y, x2: batteryNode.x, y2: batteryNode.y };
-    const batteryGridGeom = curvedLines
-      ? {
-          mode: "path",
-          pathId: "arc-grid-battery",
-          fallback: { mode: "line", x1: batteryNode.x, y1: batteryNode.y, x2: gridNode.x, y2: gridNode.y },
-          ctrlX: gridBatteryCtrlX,
-          ctrlY: gridBatteryCtrlY,
-        }
-      : { mode: "line", x1: batteryNode.x, y1: batteryNode.y, x2: gridNode.x, y2: gridNode.y };
-
-    const geom = {
-      // Grid → PV: right angle (horizontal then vertical), same anchors
-      "pv-grid": {
-        mode: "path",
-        pathId: "line-pv-grid",
-        fallback: { mode: "line", x1: gridNode.x, y1: gridPvStartY, x2: pvGridEndX, y2: pvNode.y },
-      },
-      "pv-home": { mode: "line", x1: pvNode.x, y1: pvNode.y, x2: homeNode.x, y2: homeNode.y },
-      // PV → Battery: right angle (horizontal then vertical), same anchors
-      "pv-battery": {
-        mode: "path",
-        pathId: "line-pv-battery",
-        fallback: { mode: "line", x1: pvBatteryStartX, y1: pvNode.y, x2: batteryNode.x, y2: pvBatteryEndY },
-      },
-
-      // Grid → Home: right angle (horizontal then vertical), same anchors
-      "grid-home": {
-        mode: "path",
-        pathId: "line-grid-home",
-        fallback: { mode: "line", x1: gridNode.x, y1: gridHomeStartY, x2: gridHomeEndX, y2: homeNode.y },
-      },
-      // Battery → Home: right angle (horizontal then vertical), same anchors
-      "battery-home": {
-        mode: "path",
-        pathId: "line-home-battery",
-        fallback: { mode: "line", x1: batteryNode.x, y1: batteryHomeStartY, x2: batteryHomeEndX, y2: homeNode.y },
-      },
-
-      "grid-battery": gridBatteryGeom,
-      "battery-grid": batteryGridGeom,
-    };
-
-    // Let flow dots follow the current drawn geometry (lines/paths) when updated.
-    geom["pv-grid"] = parsePathGeom(
-      "line-pv-grid",
-      { mode: "line", x1: gridNode.x, y1: gridPvStartY, x2: pvGridEndX, y2: pvNode.y },
-      true
-    );
-    geom["pv-battery"] = parsePathGeom(
-      "line-pv-battery",
-      { mode: "line", x1: pvBatteryStartX, y1: pvNode.y, x2: batteryNode.x, y2: pvBatteryEndY },
-      false
-    );
-    geom["pv-home"] = parseLineGeom("line-pv-home", geom["pv-home"]);
-    geom["grid-battery"] = curvedLines
-      ? parsePathGeom(
-          "arc-grid-battery",
-          {
-            mode: "quad",
-            x0: gridNode.x,
-            y0: gridNode.y,
-            cx: gridBatteryCtrlX,
-            cy: gridBatteryCtrlY,
-            x1: batteryNode.x,
-            y1: batteryNode.y,
-          },
-          false
-        )
-      : gridBatteryGeom;
-    geom["battery-grid"] = curvedLines
-      ? parsePathGeom(
-          "arc-grid-battery",
-          {
-            mode: "quad",
-            x0: batteryNode.x,
-            y0: batteryNode.y,
-            cx: gridBatteryCtrlX,
-            cy: gridBatteryCtrlY,
-            x1: gridNode.x,
-            y1: gridNode.y,
-          },
-          true
-        )
-      : batteryGridGeom;
-    geom["grid-home"] = parsePathGeom(
-      "line-grid-home",
-      { mode: "line", x1: gridNode.x, y1: gridHomeStartY, x2: gridHomeEndX, y2: homeNode.y },
-      false
-    );
-    geom["battery-home"] = parsePathGeom(
-      "line-home-battery",
-      { mode: "line", x1: batteryNode.x, y1: batteryHomeStartY, x2: batteryHomeEndX, y2: homeNode.y },
-      false
-    );
+    const geometry = this._getFlowGeometry(layout, this._getCurveFactor());
+    const geom = geometry.geom;
 
     const lineIdMap = {
       "pv-grid": "line-pv-grid",
@@ -2971,20 +3119,12 @@ class CompactPowerCard extends (window.LitElement ||
         ? Boolean(geom.reverse)
         : reverseOverride;
 
-    if (geom.mode === "path") {
-      const pathId = geom.pathId || null;
-      const pathEl = pathId ? this.shadowRoot?.getElementById(pathId) : null;
-      const pathData = pathEl?.getAttribute?.("d") || null;
-      if (pathData) {
-        return {
-          offsetPath: `path("${this._escapeMotionPathData(pathData)}")`,
-          reverse,
-        };
-      }
-      if (geom.fallback) {
-        return this._buildFlowMotionPath(geom.fallback, reverse);
-      }
-      return null;
+    if (geom.mode === "pathData") {
+      if (!geom.pathData) return null;
+      return {
+        offsetPath: `path("${this._escapeMotionPathData(geom.pathData)}")`,
+        reverse,
+      };
     }
 
     if (geom.mode === "quad") {
@@ -3010,6 +3150,7 @@ class CompactPowerCard extends (window.LitElement ||
     if (!dot || !handler) return;
     const shouldListen = Boolean(
       state.active &&
+      !state.reduced &&
       dot.classList.contains("active") &&
       this._hasPendingFlowUpdate(state)
     );
@@ -3022,11 +3163,13 @@ class CompactPowerCard extends (window.LitElement ||
     state.iterationListening = shouldListen;
   }
 
-  _setFlowAnimationStyles(dot, motionSpec, duration) {
+  _setFlowAnimationStyles(dot, motionSpec, duration, state = null) {
     if (!dot || !motionSpec) return;
     const start = motionSpec.reverse ? "100%" : "0%";
     const end = motionSpec.reverse ? "0%" : "100%";
     const durationMs = `${duration}ms`;
+    const signature = `anim|${motionSpec.offsetPath}|${start}|${end}|${durationMs}`;
+    if (state?.appliedSignature === signature) return;
     dot.style.removeProperty("opacity");
     dot.style.setProperty("offset-path", motionSpec.offsetPath);
     dot.style.setProperty("offset-distance", start);
@@ -3035,6 +3178,23 @@ class CompactPowerCard extends (window.LitElement ||
     }
     dot.style.setProperty("--cpc-flow-start", start);
     dot.style.setProperty("--cpc-flow-end", end);
+    dot.classList.add("active");
+    if (state) state.appliedSignature = signature;
+  }
+
+  _setFlowReducedStyles(dot, motionSpec, state = null) {
+    if (!dot || !motionSpec) return;
+    const staticDistance = motionSpec.reverse ? "65%" : "35%";
+    const signature = `reduced|${motionSpec.offsetPath}|${staticDistance}`;
+    if (state?.appliedSignature === signature) return;
+    dot.classList.remove("active");
+    dot.style.removeProperty("opacity");
+    dot.style.setProperty("offset-path", motionSpec.offsetPath);
+    dot.style.setProperty("offset-distance", staticDistance);
+    dot.style.removeProperty("--cpc-flow-duration");
+    dot.style.removeProperty("--cpc-flow-start");
+    dot.style.removeProperty("--cpc-flow-end");
+    if (state) state.appliedSignature = signature;
   }
 
   _normalizeFlowDuration(duration) {
@@ -3046,11 +3206,8 @@ class CompactPowerCard extends (window.LitElement ||
     if (a === b) return true;
     if (!a || !b || a.mode !== b.mode || Boolean(a.reverse) !== Boolean(b.reverse)) return false;
 
-    if (a.mode === "path") {
-      return (
-        a.pathId === b.pathId &&
-        this._flowGeomEquals(a.fallback || null, b.fallback || null)
-      );
+    if (a.mode === "pathData") {
+      return a.pathData === b.pathData;
     }
 
     if (a.mode === "quad") {
@@ -3092,22 +3249,34 @@ class CompactPowerCard extends (window.LitElement ||
     state.duration = this._normalizeFlowDuration(nextDuration);
     state.pendingGeom = null;
     state.pendingDuration = null;
-
-    this._setFlowAnimationStyles(dot, motionSpec, state.duration);
+    state.reduced = this._isReducedPerformanceActive();
+    if (state.reduced) {
+      dot.classList.remove("active");
+      this._setFlowReducedStyles(dot, motionSpec, state);
+    } else {
+      this._setFlowAnimationStyles(dot, motionSpec, state.duration, state);
+    }
     this._syncFlowIterationHandler(state);
   }
 
   _startFlow(name, geom, duration) {
     if (!this._flowAnimations) this._flowAnimations = {};
+    const reduced = this._isReducedPerformanceActive();
 
     const existing = this._flowAnimations[name];
     if (existing && existing.active) {
       const nextDuration = this._normalizeFlowDuration(duration);
       const geomChanged = !this._flowGeomEquals(geom, existing.geom);
       const durationChanged = nextDuration !== existing.duration;
+      const reducedChanged = Boolean(existing.reduced) !== reduced;
 
       existing.pendingGeom = geomChanged ? geom : null;
       existing.pendingDuration = durationChanged ? nextDuration : null;
+      existing.reduced = reduced;
+      if (reduced || reducedChanged) {
+        this._commitFlowAnimation(name, existing);
+        return;
+      }
       this._syncFlowIterationHandler(existing);
       return;
     }
@@ -3126,6 +3295,8 @@ class CompactPowerCard extends (window.LitElement ||
       pendingDuration: null,
       iterationHandler: null,
       iterationListening: false,
+      reduced,
+      appliedSignature: null,
     };
 
     const iterationHandler = () => {
@@ -3139,7 +3310,6 @@ class CompactPowerCard extends (window.LitElement ||
 
     this._flowAnimations[name] = animState;
     this._commitFlowAnimation(name, animState);
-    dot.classList.add("active");
   }
 
   _stopFlow(name) {
@@ -3247,6 +3417,7 @@ class CompactPowerCard extends (window.LitElement ||
     const { sources: normalizedSources } = this._getSourcesConfig();
     const enableDevicePowerLines = this._useDevicePowerLines();
     const allowGlow = this._allowGlowEffects();
+    const reducedPerformanceActive = this._isReducedPerformanceActive();
     const homeGlowOpacity = allowGlow ? 0.3 : 0;
     const homeTapAction = String(homeCfg?.tap_action || "more_info").toLowerCase();
     const homeNavigatePath = homeCfg?.navigation_path || homeCfg?.navigationPath || null;
@@ -3272,6 +3443,7 @@ class CompactPowerCard extends (window.LitElement ||
       hasBattery,
       hasAnyLabels,
     });
+    const geometry = this._getFlowGeometry(layout, this._getCurveFactor());
     const {
       designWidth,
       designHeight,
@@ -3518,6 +3690,10 @@ class CompactPowerCard extends (window.LitElement ||
     if (!this._labelFlickerStates) this._labelFlickerStates = new Map();
     const nextLabelStates = new Map();
     const recordLabelFlicker = (key, active) => {
+      if (reducedPerformanceActive) {
+        nextLabelStates.set(key, { active, flickerUntil: 0 });
+        return false;
+      }
       const prevState = this._labelFlickerStates.get(key) || {};
       let flickerUntil = prevState.flickerUntil || 0;
       if (prevState.active && !active) {
@@ -3587,13 +3763,16 @@ class CompactPowerCard extends (window.LitElement ||
             : Math.min(nextLabelFlickerEnd, flickerUntil);
       }
     }
-    if (nextLabelFlickerEnd != null) {
+    if (!reducedPerformanceActive && nextLabelFlickerEnd != null) {
       const delay = Math.max(0, nextLabelFlickerEnd - labelFlickerNow + 20);
       if (this._labelFlickerTimer) clearTimeout(this._labelFlickerTimer);
       this._labelFlickerTimer = setTimeout(() => {
         this._labelFlickerTimer = null;
         this.requestUpdate();
       }, delay);
+    } else if (this._labelFlickerTimer) {
+      clearTimeout(this._labelFlickerTimer);
+      this._labelFlickerTimer = null;
     }
 
     const battVal = Number.isFinite(battDisplay)
@@ -3629,8 +3808,6 @@ class CompactPowerCard extends (window.LitElement ||
     const batteryIconOpacity = 1;
     const curveFactor = this._getCurveFactor();
     const curvedLines = curveFactor > 0;
-    const curveScale = curvedLines ? (curveFactor - 1) / 4 : 0; // 0 at factor 1, 1 at factor 5
-    const cornerBaseRadius = pvGridTurnRadius;
     const sourcePositions = [];
     const homeX = homeCenterX;
     const homeRowYBase = 145 + deviceYOffset; // base Y for aux row; actual Y will be adjusted via pctHomeY
@@ -3742,16 +3919,18 @@ class CompactPowerCard extends (window.LitElement ||
         } else {
           active = src.numeric > 0 && !src.hidden;
         }
-        const prevState = this._deviceLineStates.get(key) || {};
-        flickerUntil = prevState.flickerUntil || 0;
-        if (prevState.active && !active) {
-          flickerUntil = deviceFlickerNow + deviceFlickerMs;
+        if (!reducedPerformanceActive) {
+          const prevState = this._deviceLineStates.get(key) || {};
+          flickerUntil = prevState.flickerUntil || 0;
+          if (prevState.active && !active) {
+            flickerUntil = deviceFlickerNow + deviceFlickerMs;
+          }
+          if (active) flickerUntil = 0;
+          if (flickerUntil && flickerUntil <= deviceFlickerNow) {
+            flickerUntil = 0;
+          }
+          flicker = flickerUntil > deviceFlickerNow;
         }
-        if (active) flickerUntil = 0;
-        if (flickerUntil && flickerUntil <= deviceFlickerNow) {
-          flickerUntil = 0;
-        }
-        flicker = flickerUntil > deviceFlickerNow;
         nextDeviceStates.set(key, { active, flickerUntil });
       }
       const leftPct = pos.leftPct != null ? pos.leftPct : (pos.x / baseWidth) * 100;
@@ -3810,6 +3989,29 @@ class CompactPowerCard extends (window.LitElement ||
     }
     this._deviceLines = deviceLines;
     this._deviceLineStates = nextDeviceStates;
+    this._deviceLinesSignature = [
+      reducedPerformanceActive ? 1 : 0,
+      enableDevicePowerLines ? 1 : 0,
+      deviceLines
+        .map((ln) => {
+          const state = nextDeviceStates.get(ln.key) || {};
+          const flicker = !reducedPerformanceActive && (state.flickerUntil || 0) > deviceFlickerNow ? 1 : 0;
+          return [
+            ln.key,
+            ln.active ? 1 : 0,
+            ln.color,
+            ln.opacity,
+            ln.startX,
+            ln.startY,
+            ln.downY,
+            ln.upY,
+            ln.homeX,
+            ln.dashed ? 1 : 0,
+            flicker,
+          ].join(",");
+        })
+        .join(";"),
+    ].join("|");
 
     const pvLabelPositions = [];
     const pvLabelPad = Math.max(16, baseWidth * 0.05);
@@ -3946,6 +4148,7 @@ class CompactPowerCard extends (window.LitElement ||
     this.classList.toggle("has-grid-labels", hasGridLabels);
     this.classList.toggle("has-battery-labels", hasBatteryLabels);
     this.classList.toggle("has-single-side-label", hasSingleSideLabel);
+    this.classList.toggle("reduced-performance", reducedPerformanceActive);
 
     const allowExtraPvLabels =
       (rowCount === 3 && gridLabels.length <= 1 && batteryLabelSource.length <= 1) ||
@@ -4093,47 +4296,14 @@ class CompactPowerCard extends (window.LitElement ||
     const batteryListAnchor = gridNodeY - 18; // align list a bit above node
     const batteryDetailsOffsetPx = 44; // vertical gap from the icon/label to the multi list
     const batteryDetailsTopPx = batteryListAnchor + batteryDetailsOffsetPx;
-
-
-    const makeCornerPath = (startX, startY, endX, endY, sweepFlag, firstAxis = "H") => {
-      if (!curvedLines) return firstAxis === "H"
-        ? `M${startX} ${startY} H${endX} V${endY}`
-        : `M${startX} ${startY} V${endY} H${endX}`;
-
-      const spanX = Math.abs(endX - startX);
-      const spanY = Math.abs(endY - startY);
-      const cornerX = firstAxis === "H" ? endX : startX;
-      const cornerY = firstAxis === "H" ? startY : endY;
-
-      if (curveFactor >= 5) {
-        // Single smooth curve from start to end via the corner.
-        return `M${startX} ${startY} Q${cornerX} ${cornerY} ${endX} ${endY}`;
-      }
-
-      const maxInset = Math.min(spanX, spanY); // so inset never exceeds the shorter leg
-      const inset = cornerBaseRadius + (maxInset - cornerBaseRadius) * curveScale;
-      const r = inset;
-
-      if (firstAxis === "H") {
-        const horizEnd = endX > startX ? endX - inset : endX + inset;
-        const arcEndY = endY > startY ? startY + inset : startY - inset;
-        const sweep = sweepFlag; // 0 or 1
-        return `M${startX} ${startY} H${horizEnd} A${r} ${r} 0 0 ${sweep} ${endX} ${arcEndY} V${endY}`;
-      } else {
-        const vertEnd = endY > startY ? endY - inset : endY + inset;
-        const arcEndX = endX > startX ? startX + inset : startX - inset;
-        const sweep = sweepFlag;
-        return `M${startX} ${startY} V${vertEnd} A${r} ${r} 0 0 ${sweep} ${arcEndX} ${endY} H${endX}`;
-      }
-    };
-
-    const pvGridPath = makeCornerPath(gridLineStartX, gridPvStartY, pvGridEndX, pvNode.y, 0, "H");
-    const pvBatteryPath = makeCornerPath(pvBatteryStartX, pvNode.y, batteryNode.x, pvBatteryEndY, 0, "V");
-    const gridHomePath = makeCornerPath(gridNode.x, gridHomeStartY, gridHomeEndX, homeNode.y, 1, "H");
-    const batteryHomePath = makeCornerPath(batteryNode.x, batteryHomeStartY, batteryHomeEndX, homeNode.y, 0, "H");
-    const gridBatteryPath = curvedLines
-      ? `M${gridNode.x} ${gridNode.y} H${humpStartX} Q${humpCtrlInX} ${humpPeakY} ${homeCenterX} ${humpPeakY} Q${humpCtrlOutX} ${humpPeakY} ${humpEndX} ${gridNode.y} H${batteryNode.x}`
-      : `M${gridNode.x} ${gridNode.y} H${batteryNode.x}`;
+    const {
+      pvGridPath,
+      pvBatteryPath,
+      gridHomePath,
+      batteryHomePath,
+      gridBatteryPath,
+      pvHomeLine,
+    } = geometry;
 
     const layoutReady = this._layoutReady;
     const hideCardBackground = this._coerceBoolean(this._config?.hide_card_background, false);
@@ -4158,7 +4328,7 @@ class CompactPowerCard extends (window.LitElement ||
           <!-- Flow lines, updated endpoints (straight lines) -->
           <path id="line-pv-grid" class="flow-line" fill="none" d="${pvGridPath}" />
           <line id="line-pv-home" class="flow-line"
-                x1="${pvNode.x}" y1="${pvNode.y}" x2="${homeNode.x}" y2="${homeNode.y}" />
+                x1="${pvHomeLine.x1}" y1="${pvHomeLine.y1}" x2="${pvHomeLine.x2}" y2="${pvHomeLine.y2}" />
           <path id="line-pv-battery" class="flow-line" fill="none" d="${pvBatteryPath}" />
           <path id="line-grid-home" class="flow-line" fill="none" d="${gridHomePath}" />
           <path id="line-home-battery" class="flow-line" fill="none" d="${batteryHomePath}" />
@@ -4212,7 +4382,7 @@ class CompactPowerCard extends (window.LitElement ||
                     ${pvInBatterySlot
                       ? ""
                       : html`<div
-                          class="node-label ${pvLabelFlicker ? "label-flicker" : ""}"
+                          class="node-label ${pvLabelFlicker && !reducedPerformanceActive ? "label-flicker" : ""}"
                           style="color:${pvColor}; --label-opacity:${pvLabelHidden ? 0.35 : pvOpacity}; opacity: var(--label-opacity);"
                         >
                           <span>${renderValue(pvVal)}</span>
@@ -4240,7 +4410,7 @@ class CompactPowerCard extends (window.LitElement ||
                         </div>`
                       : html`<ha-icon icon="${pvIconId}" style="color:${pvColor}; opacity:1; filter:${allowGlow && pvNumeric !== 0 ? `drop-shadow(0 0 10px ${pvColor})` : "none"};"></ha-icon>`}
                     <div
-                      class="node-label right ${pvLabelFlicker ? "label-flicker" : ""}"
+                      class="node-label right ${pvLabelFlicker && !reducedPerformanceActive ? "label-flicker" : ""}"
                       style="color:${pvColor}; --label-opacity:${pvLabelHidden ? 0.35 : pvOpacity}; opacity: var(--label-opacity);"
                     >
                       <span>${renderValue(pvVal)}</span>
@@ -4259,7 +4429,7 @@ class CompactPowerCard extends (window.LitElement ||
                     </div>`
                   : html`<ha-icon icon="${gridIconId}" style="color:${gridColor}; opacity:1; filter:${allowGlow && gridNumeric !== 0 ? `drop-shadow(0 0 10px ${gridColor})` : "none"};"></ha-icon>`}
                 <div
-                  class="node-label left ${gridLabelFlicker ? "label-flicker" : ""}"
+                  class="node-label left ${gridLabelFlicker && !reducedPerformanceActive ? "label-flicker" : ""}"
                   style="color:${gridColor}; --label-opacity:${gridLabelHidden ? 0.35 : gridOpacity}; opacity: var(--label-opacity);"
                 >
                   ${gridArrow && !gridLabelHidden
@@ -4311,7 +4481,7 @@ class CompactPowerCard extends (window.LitElement ||
             </div>
             ${enableDevicePowerLines && hasDeviceSources && deviceUsageActive
               ? html`<div class="overlay-item device-power-dot-wrapper" style="left:${(homeCenterX/baseWidth)*100}%; top: calc(${deviceJunctionTopPct}% + 4px);">
-                  <div class="device-power-dot ${deviceUsageActive ? "active" : ""}" style="color:${homeColor};${deviceUsageActive ? `animation-duration:${devicePulseSeconds.toFixed(2)}s;` : ""}"></div>
+                  <div class="device-power-dot ${deviceUsageActive && !reducedPerformanceActive ? "active" : ""}" style="color:${homeColor};${deviceUsageActive && !reducedPerformanceActive ? `animation-duration:${devicePulseSeconds.toFixed(2)}s;` : ""}"></div>
                 </div>`
               : ""}
             ${hasBattery
@@ -4328,7 +4498,7 @@ class CompactPowerCard extends (window.LitElement ||
                         </div>`
                       : html`<ha-icon icon="${batteryIconId}" style="color:${batteryColor}; opacity:${batteryIconOpacity}; filter:${allowGlow && battNumericW !== 0 ? `drop-shadow(0 0 10px ${batteryColor})` : "none"};"></ha-icon>`}
                     <div
-                      class="node-label right ${batteryLabelFlicker ? "label-flicker" : ""}"
+                      class="node-label right ${batteryLabelFlicker && !reducedPerformanceActive ? "label-flicker" : ""}"
                       style="color:${batteryColor}; --label-opacity:${batteryLabelHidden ? 0.35 : batteryLabelOpacity}; opacity: var(--label-opacity);"
                     >
                       ${battArrow && !batteryLabelHidden
@@ -4385,7 +4555,7 @@ class CompactPowerCard extends (window.LitElement ||
                     ></ha-icon>
                   </span>
                   <div
-                    class="aux-label clickable ${src.flicker ? "device-label-flicker" : ""}"
+                    class="aux-label clickable ${src.flicker && !reducedPerformanceActive ? "device-label-flicker" : ""}"
                     style="color:${src.color}; --device-label-opacity:${src.hidden ? 0.35 : src.opacity}; opacity: var(--device-label-opacity);"
                     @click=${() => {
                       if (src.switchEntity) {
