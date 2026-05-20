@@ -505,6 +505,10 @@ class CompactPowerCard extends (window.LitElement ||
     super();
     this._hass = null;
     this._flowAnimations = {};
+    this._geometryCache = null;
+    this._derivedSnapshot = null;
+    this._derivedSnapshotDirty = true;
+    this._renderState = null;
     this._layoutMetricsCache = null;
     this._homeEffective = null;
     this._homeEffectiveUnit = "W";
@@ -519,12 +523,30 @@ class CompactPowerCard extends (window.LitElement ||
     this._labelFlickerStates = new Map();
     this._labelFlickerTimer = null;
     this._trackedEntityIds = new Set();
+    this._trackedEntityAttributes = new Map();
     this._lastEntityStates = new Map();
     this._lastThemeMode = null;
+    this._lastVisibleStateSignature = null;
     this._iconPathCache = new Map();
     this._iconPathPending = new Set();
     this._pendingFlowUpdate = false;
-    this._lastFlowLayoutKey = null;
+    this._deviceLineRefreshRequested = false;
+    this._lineStyleCache = new Map();
+    this._lastRenderedFlowSignature = null;
+    this._lastRenderedFlowGeometryKey = null;
+    this._lastRenderedDeviceLineSignature = null;
+    this._lastRenderedDeviceLineGeometryKey = null;
+    this._lastLayoutSyncKey = null;
+    this._lastHomeGradientSignature = null;
+    this._updateTimeout = null;
+    this._homeGradientFrame = null;
+    this._loafObserver = null;
+    this._loafSupported = false;
+    this._loafSamples = [];
+    this._reducedPerformanceActive = false;
+    this._reducedPerformanceUntil = 0;
+    this._reducedPerformanceTimer = null;
+    this._lastReducedPerformanceReason = null;
     this._layoutReady = false;
   }
 
@@ -540,9 +562,11 @@ class CompactPowerCard extends (window.LitElement ||
   _scheduleUpdate() {
     if (this._updateTimeout) return;
     this._updateTimeout = setTimeout(() => {
-      this._updateFlows();
-      this.requestUpdate();
       this._updateTimeout = null;
+      this._pendingFlowUpdate = true;
+      this._deviceLineRefreshRequested = true;
+      this._invalidateDerivedSnapshot();
+      this.requestUpdate();
     }, 1000); // Throttle to 1 update per second
   }
 
@@ -566,9 +590,12 @@ class CompactPowerCard extends (window.LitElement ||
       ? Math.min(2.0, Math.max(0.5, fontScaleRaw))
       : 1;
     this.style.setProperty("--cpc-text-scale", String(fontScale));
-    this._trackedEntityIds = this._collectEntityIds();
+    this._trackedEntityAttributes = this._collectTrackedEntityAttributes();
+    this._trackedEntityIds = new Set(this._trackedEntityAttributes.keys());
     this._lastEntityStates.clear();
     this._lastThemeMode = null;
+    this._lastVisibleStateSignature = null;
+    this._invalidateDerivedSnapshot();
   }
 
   static get styles() {
@@ -1191,18 +1218,49 @@ class CompactPowerCard extends (window.LitElement ||
 
   updated(changedProps) {
     if (super.updated) super.updated(changedProps);
-    this._adjustLayout();
-    this._renderDeviceLines();
     this._logLayoutSizes();
-    const layoutKey = `${this._hostWidth ?? 0}x${this._hostHeight ?? 0}x${this._externalHeight ?? 0}`;
-    if (layoutKey !== this._lastFlowLayoutKey) {
-      this._lastFlowLayoutKey = layoutKey;
-      this._updateFlows();
+    const snapshot = this._renderState?.snapshot || this._getDerivedSnapshot();
+    const geometryKey = snapshot?.geometry?.key || null;
+    const layoutSyncKey = snapshot?.layout?.key || `${this._hostWidth ?? 0}x${this._hostHeight ?? 0}x${this._externalHeight ?? 0}`;
+    const layoutChanged = layoutSyncKey !== this._lastLayoutSyncKey;
+
+    if (layoutChanged) {
+      this._lastLayoutSyncKey = layoutSyncKey;
+      this._adjustLayout();
     }
-    if (this._pendingFlowUpdate && this.shadowRoot) {
+
+    if (!this.shadowRoot || !snapshot) {
+      this._renderState = null;
+      return;
+    }
+
+    const flowSignature = snapshot.flowSignature || "";
+    if (
+      layoutChanged ||
+      geometryKey !== this._lastRenderedFlowGeometryKey ||
+      flowSignature !== this._lastRenderedFlowSignature ||
+      this._pendingFlowUpdate
+    ) {
       this._pendingFlowUpdate = false;
-      this._updateFlows();
+      this._updateFlows(snapshot);
+      this._lastRenderedFlowSignature = flowSignature;
+      this._lastRenderedFlowGeometryKey = geometryKey;
     }
+
+    const deviceLineSignature = this._deviceLineRenderSignature || "";
+    if (
+      layoutChanged ||
+      geometryKey !== this._lastRenderedDeviceLineGeometryKey ||
+      deviceLineSignature !== this._lastRenderedDeviceLineSignature ||
+      this._deviceLineRefreshRequested
+    ) {
+      this._deviceLineRefreshRequested = false;
+      this._renderDeviceLines();
+      this._lastRenderedDeviceLineSignature = this._deviceLineRenderSignature || "";
+      this._lastRenderedDeviceLineGeometryKey = geometryKey;
+    }
+
+    this._renderState = null;
   }
 
   _logLayoutSizes() {
@@ -1333,6 +1391,7 @@ class CompactPowerCard extends (window.LitElement ||
     const homeNode = { x: homeCenterX, y: homeLineEndY };
 
     const layout = {
+      key: layoutCacheKey,
       designWidth,
       designHeight,
       defaultWidth,
@@ -1480,8 +1539,12 @@ class CompactPowerCard extends (window.LitElement ||
       if (this._deviceLineFlickerTimer) clearTimeout(this._deviceLineFlickerTimer);
       this._deviceLineFlickerTimer = setTimeout(() => {
         this._deviceLineFlickerTimer = null;
+        this._deviceLineRefreshRequested = true;
         this.requestUpdate();
       }, delay);
+    } else if (this._deviceLineFlickerTimer) {
+      clearTimeout(this._deviceLineFlickerTimer);
+      this._deviceLineFlickerTimer = null;
     }
   }
 
@@ -1501,8 +1564,13 @@ class CompactPowerCard extends (window.LitElement ||
           const prevH = this._hostHeight;
           this._hostWidth = newW;
           this._hostHeight = newH;
-          const widthChanged = prevW != null && newW !== prevW;
           this._externalHeight = newH;
+          if (prevW !== newW || prevH !== newH) {
+            this._pendingFlowUpdate = true;
+            this._deviceLineRefreshRequested = true;
+            this._invalidateDerivedSnapshot();
+            this.requestUpdate();
+          }
           if (prevW == null || prevH == null) {
             this.requestUpdate();
           }
@@ -1512,6 +1580,7 @@ class CompactPowerCard extends (window.LitElement ||
     }
     this._resizeObserver.observe(this);
     this._updateScale();
+    this._startLoafObserver();
   }
 
 
@@ -1520,6 +1589,35 @@ class CompactPowerCard extends (window.LitElement ||
       this._resizeObserver.disconnect();
       this._resizeObserver = null;
     }
+    if (this._loafObserver) {
+      this._loafObserver.disconnect();
+      this._loafObserver = null;
+    }
+    if (this._updateTimeout) {
+      clearTimeout(this._updateTimeout);
+      this._updateTimeout = null;
+    }
+    if (this._deviceLineFlickerTimer) {
+      clearTimeout(this._deviceLineFlickerTimer);
+      this._deviceLineFlickerTimer = null;
+    }
+    if (this._labelFlickerTimer) {
+      clearTimeout(this._labelFlickerTimer);
+      this._labelFlickerTimer = null;
+    }
+    if (this._reducedPerformanceTimer) {
+      clearTimeout(this._reducedPerformanceTimer);
+      this._reducedPerformanceTimer = null;
+    }
+    this._loafSamples = [];
+    this._reducedPerformanceActive = false;
+    this._reducedPerformanceUntil = 0;
+    this._lastReducedPerformanceReason = null;
+    if (this._homeGradientFrame) {
+      cancelAnimationFrame(this._homeGradientFrame);
+      this._homeGradientFrame = null;
+    }
+    Object.keys(this._flowAnimations || {}).forEach((name) => this._stopFlow(name));
     super.disconnectedCallback();
   }
 
@@ -1561,6 +1659,457 @@ class CompactPowerCard extends (window.LitElement ||
     const delta = gap - desiredGap;
 
     svg.style.transform = `translateY(${-delta}px)`;
+  }
+
+  _invalidateDerivedSnapshot() {
+    this._derivedSnapshot = null;
+    this._derivedSnapshotDirty = true;
+    this._renderState = null;
+  }
+
+  _stringifySignatureValue(value) {
+    if (value === undefined) return "undefined";
+    if (value === null) return "null";
+    if (typeof value === "object") {
+      try {
+        return JSON.stringify(value);
+      } catch (err) {
+        return String(value);
+      }
+    }
+    return String(value);
+  }
+
+  _trackEntityAttribute(map, entityId, attribute = null) {
+    if (!entityId) return;
+    if (!map.has(entityId)) map.set(entityId, new Set());
+    if (attribute) {
+      map.get(entityId).add(String(attribute));
+    }
+  }
+
+  _collectTrackedEntityAttributes() {
+    const tracked = new Map();
+    const ents = this._config?.entities || {};
+    const add = (entityId, attribute = null) => {
+      this._trackEntityAttribute(tracked, entityId, attribute);
+    };
+    const addEntityConfig = (cfg) => {
+      if (!cfg) return;
+      if (Array.isArray(cfg)) {
+        cfg.forEach(addEntityConfig);
+        return;
+      }
+      const entityId = this._extractEntityRef(cfg);
+      const attribute =
+        cfg && typeof cfg === "object" ? cfg.attribute || cfg.attr || null : null;
+      add(entityId, attribute);
+    };
+    const addLabels = (labels) => {
+      labels.forEach((lbl) => {
+        add(this._extractEntityRef(lbl?.entity), lbl?.attribute || lbl?.attr || null);
+      });
+    };
+
+    addEntityConfig(ents.pv);
+    addEntityConfig(ents.grid);
+    addEntityConfig(ents.home);
+    addEntityConfig(ents.battery);
+    add(this._extractEntityRef(ents.grid?.import_entity || ents.grid?.importEntity));
+    add(this._extractEntityRef(ents.grid?.export_entity || ents.grid?.exportEntity));
+
+    const pvLabels = this._normalizeLabels(ents.pv?.labels, null);
+    const gridLabels = this._normalizeLabels(ents.grid?.labels, null);
+    const batteryLabelsSource = Array.isArray(ents.battery)
+      ? ents.battery_labels || ents.battery?.labels
+      : ents.battery?.labels;
+    const batteryLabels = this._normalizeLabels(batteryLabelsSource, null);
+    addLabels(pvLabels);
+    addLabels(gridLabels);
+    addLabels(batteryLabels);
+
+    const batteryList = Array.isArray(ents.battery)
+      ? ents.battery
+      : ents.battery
+      ? [ents.battery]
+      : [];
+    for (const cfg of batteryList) {
+      add(this._extractEntityRef(cfg?.charge_entity || cfg?.chargeEntity));
+      add(this._extractEntityRef(cfg?.discharge_entity || cfg?.dischargeEntity));
+      const socRef = this._getBatterySocRef(cfg);
+      if (socRef?.entity) {
+        add(socRef.entity, socRef.attribute || null);
+      }
+    }
+
+    const { sources } = this._getSourcesConfig();
+    sources.forEach((src) => {
+      add(this._extractEntityRef(src?.entity), src?.attribute || src?.attr || null);
+      add(this._extractEntityRef(src?.switch_entity || src?.switchEntity));
+      add(this._extractEntityRef(src?.name));
+    });
+
+    return tracked;
+  }
+
+  _buildVisibleStateSignature(hass) {
+    const themeMode = hass?.themes?.darkMode ?? null;
+    const parts = [`theme=${this._stringifySignatureValue(themeMode)}`];
+    const tracked = this._trackedEntityAttributes || new Map();
+    if (!tracked.size) return parts.join("|");
+
+    const ids = Array.from(tracked.keys()).sort();
+    for (const entityId of ids) {
+      const st = hass?.states?.[entityId];
+      if (!st) {
+        parts.push(`${entityId}:missing`);
+        continue;
+      }
+      const attrs = st.attributes || {};
+      const attrParts = Array.from(tracked.get(entityId) || [])
+        .sort()
+        .map((attribute) => `${attribute}=${this._stringifySignatureValue(attrs?.[attribute])}`);
+      parts.push(
+        [
+          entityId,
+          `state=${this._stringifySignatureValue(st.state)}`,
+          `unit=${this._stringifySignatureValue(attrs.unit_of_measurement)}`,
+          `icon=${this._stringifySignatureValue(attrs.icon)}`,
+          `device_class=${this._stringifySignatureValue(attrs.device_class)}`,
+          ...attrParts,
+        ].join(",")
+      );
+    }
+
+    return parts.join("|");
+  }
+
+  _startLoafObserver() {
+    if (this._loafObserver) return;
+    if (typeof PerformanceObserver === "undefined") {
+      this._loafSupported = false;
+      return;
+    }
+    const supportedEntryTypes = PerformanceObserver.supportedEntryTypes;
+    this._loafSupported =
+      Array.isArray(supportedEntryTypes) &&
+      supportedEntryTypes.includes("long-animation-frame");
+    if (!this._loafSupported) return;
+
+    try {
+      this._loafObserver = new PerformanceObserver((entryList) => {
+        this._handleLoafEntries(entryList);
+      });
+      this._loafObserver.observe({ type: "long-animation-frame", buffered: true });
+    } catch (err) {
+      this._loafSupported = false;
+      this._loafObserver = null;
+    }
+  }
+
+  _handleLoafEntries(entryList) {
+    const entries = typeof entryList?.getEntries === "function" ? entryList.getEntries() : [];
+    if (!entries.length) return;
+    const now = typeof performance?.now === "function" ? performance.now() : Date.now();
+    let qualifyingCount = 0;
+    for (const entry of entries) {
+      if ((entry?.duration || 0) <= 75) continue;
+      this._loafSamples.push(now);
+      qualifyingCount += 1;
+    }
+    if (!qualifyingCount) return;
+    this._pruneLoafSamples(now);
+    if (this._loafSamples.length >= 3) {
+      this._activateReducedPerformance("loaf", now);
+    }
+  }
+
+  _pruneLoafSamples(now) {
+    const cutoff = now - 15000;
+    this._loafSamples = (this._loafSamples || []).filter((timestamp) => timestamp >= cutoff);
+  }
+
+  _scheduleReducedPerformanceTimer(now) {
+    if (!this._reducedPerformanceActive) return;
+    if (this._reducedPerformanceTimer) {
+      clearTimeout(this._reducedPerformanceTimer);
+      this._reducedPerformanceTimer = null;
+    }
+    const delay = Math.max(0, Math.ceil((this._reducedPerformanceUntil || 0) - now));
+    this._reducedPerformanceTimer = setTimeout(() => {
+      this._reducedPerformanceTimer = null;
+      this._onReducedPerformanceTimer();
+    }, delay);
+  }
+
+  _activateReducedPerformance(reason, now) {
+    const wasActive = this._reducedPerformanceActive;
+    const nextUntil = now + 30000;
+    this._reducedPerformanceActive = true;
+    this._lastReducedPerformanceReason = reason;
+    this._reducedPerformanceUntil = Math.max(this._reducedPerformanceUntil || 0, nextUntil);
+    this._scheduleReducedPerformanceTimer(now);
+    if (!wasActive) {
+      this._handleReducedPerformanceStateChange();
+    }
+  }
+
+  _onReducedPerformanceTimer() {
+    if (!this._reducedPerformanceActive) return;
+    const now = typeof performance?.now === "function" ? performance.now() : Date.now();
+    this._pruneLoafSamples(now);
+    if (this._loafSamples.length >= 3) {
+      this._reducedPerformanceUntil = now + 30000;
+      this._scheduleReducedPerformanceTimer(now);
+      return;
+    }
+    this._reducedPerformanceActive = false;
+    this._reducedPerformanceUntil = 0;
+    this._lastReducedPerformanceReason = null;
+    this._handleReducedPerformanceStateChange();
+  }
+
+  _handleReducedPerformanceStateChange() {
+    if (this._deviceLineFlickerTimer) {
+      clearTimeout(this._deviceLineFlickerTimer);
+      this._deviceLineFlickerTimer = null;
+    }
+    if (this._labelFlickerTimer) {
+      clearTimeout(this._labelFlickerTimer);
+      this._labelFlickerTimer = null;
+    }
+    if (this._isReducedPerformanceActive()) {
+      this._labelFlickerStates = new Map(
+        Array.from(this._labelFlickerStates.entries()).map(([key, state]) => [
+          key,
+          { active: Boolean(state?.active), flickerUntil: 0 },
+        ])
+      );
+      this._deviceLineStates = new Map(
+        Array.from(this._deviceLineStates.entries()).map(([key, state]) => [
+          key,
+          { active: Boolean(state?.active), flickerUntil: 0 },
+        ])
+      );
+    }
+    this._pendingFlowUpdate = true;
+    this._deviceLineRefreshRequested = true;
+    this._lastRenderedFlowSignature = null;
+    this._lastRenderedDeviceLineSignature = null;
+    this._invalidateDerivedSnapshot();
+    this.requestUpdate();
+  }
+
+  _isReducedPerformanceActive() {
+    return Boolean(this._reducedPerformanceActive);
+  }
+
+  _makeCornerPath(
+    startX,
+    startY,
+    endX,
+    endY,
+    sweepFlag,
+    firstAxis,
+    curvedLines,
+    curveFactor,
+    cornerBaseRadius
+  ) {
+    if (!curvedLines) {
+      return firstAxis === "H"
+        ? `M${startX} ${startY} H${endX} V${endY}`
+        : `M${startX} ${startY} V${endY} H${endX}`;
+    }
+
+    const spanX = Math.abs(endX - startX);
+    const spanY = Math.abs(endY - startY);
+    const cornerX = firstAxis === "H" ? endX : startX;
+    const cornerY = firstAxis === "H" ? startY : endY;
+    if (curveFactor >= 5) {
+      return `M${startX} ${startY} Q${cornerX} ${cornerY} ${endX} ${endY}`;
+    }
+
+    const curveScale = (curveFactor - 1) / 4;
+    const maxInset = Math.min(spanX, spanY);
+    const inset = cornerBaseRadius + (maxInset - cornerBaseRadius) * curveScale;
+    const radius = inset;
+
+    if (firstAxis === "H") {
+      const horizEnd = endX > startX ? endX - inset : endX + inset;
+      const arcEndY = endY > startY ? startY + inset : startY - inset;
+      return `M${startX} ${startY} H${horizEnd} A${radius} ${radius} 0 0 ${sweepFlag} ${endX} ${arcEndY} V${endY}`;
+    }
+
+    const vertEnd = endY > startY ? endY - inset : endY + inset;
+    const arcEndX = endX > startX ? startX + inset : startX - inset;
+    return `M${startX} ${startY} V${vertEnd} A${radius} ${radius} 0 0 ${sweepFlag} ${arcEndX} ${endY} H${endX}`;
+  }
+
+  _buildDeviceAnchorPositions(layout, deviceCount, homeRowYBase) {
+    const maxDevices = Math.min(deviceCount, layout.maxItemsByColumns);
+    if (maxDevices <= 0) return [];
+
+    const positions = [];
+    const deviceWidth = layout.baseWidth;
+    const pad = Math.max(16, deviceWidth * 0.05);
+    const columnWidth = layout.columnCount > 0 ? deviceWidth / layout.columnCount : deviceWidth / 12;
+    const spacingBase = Math.max(
+      columnWidth * 1.5,
+      56 * (deviceWidth / layout.designWidth)
+    );
+    const deviceRings = Math.max(1, Math.ceil(maxDevices / 2));
+    const maxSpacing = (deviceWidth / 2 - pad) / deviceRings;
+    const spacing = Math.max(0, Math.min(spacingBase, maxSpacing));
+
+    for (let ring = 1; positions.length < maxDevices; ring += 1) {
+      const leftX = layout.homeCenterX - spacing * ring;
+      const rightX = layout.homeCenterX + spacing * ring;
+      const clampedLeft = Math.max(pad, Math.min(deviceWidth - pad, leftX));
+      const clampedRight = Math.max(pad, Math.min(deviceWidth - pad, rightX));
+      positions.push({
+        x: clampedLeft,
+        y: homeRowYBase,
+        leftPct: (clampedLeft / deviceWidth) * 100,
+      });
+      if (positions.length < maxDevices) {
+        positions.push({
+          x: clampedRight,
+          y: homeRowYBase,
+          leftPct: (clampedRight / deviceWidth) * 100,
+        });
+      }
+      if (ring >= deviceRings) break;
+    }
+
+    return positions;
+  }
+
+  _buildMotionSpecFromPathData(pathData, reverse = false) {
+    if (!pathData) return null;
+    return {
+      offsetPath: `path("${this._escapeMotionPathData(pathData)}")`,
+      reverse,
+    };
+  }
+
+  _buildMotionSpecFromLine(x1, y1, x2, y2, reverse = false) {
+    if (!this._hasFiniteCoords([x1, y1, x2, y2])) return null;
+    return this._buildMotionSpecFromPathData(`M ${x1} ${y1} L ${x2} ${y2}`, reverse);
+  }
+
+  _getGeometryBundle(layout, { deviceCount = 0, homeRowYBase = 145 } = {}) {
+    const curveFactor = this._getCurveFactor();
+    const key = [layout.key, `curve=${curveFactor}`, `devices=${deviceCount}`, `homeRow=${homeRowYBase}`].join("|");
+    if (this._geometryCache?.key === key) {
+      return this._geometryCache.value;
+    }
+
+    const curvedLines = curveFactor > 0;
+    const {
+      baseWidth,
+      homeCenterX,
+      pvGridTurnRadius,
+      pvGridEndX,
+      pvBatteryStartX,
+      pvBatteryEndY,
+      gridHomeStartY,
+      gridHomeEndX,
+      batteryHomeStartY,
+      batteryHomeEndX,
+      gridLineStartX,
+      gridPvStartY,
+      pvNode,
+      batteryNode,
+      gridNode,
+      homeNode,
+      humpStartX,
+      humpCtrlInX,
+      humpPeakY,
+      humpCtrlOutX,
+      humpEndX,
+    } = layout;
+
+    const pvGridPath = this._makeCornerPath(
+      gridLineStartX,
+      gridPvStartY,
+      pvGridEndX,
+      pvNode.y,
+      0,
+      "H",
+      curvedLines,
+      curveFactor,
+      pvGridTurnRadius
+    );
+    const pvBatteryPath = this._makeCornerPath(
+      pvBatteryStartX,
+      pvNode.y,
+      batteryNode.x,
+      pvBatteryEndY,
+      0,
+      "V",
+      curvedLines,
+      curveFactor,
+      pvGridTurnRadius
+    );
+    const gridHomePath = this._makeCornerPath(
+      gridNode.x,
+      gridHomeStartY,
+      gridHomeEndX,
+      homeNode.y,
+      1,
+      "H",
+      curvedLines,
+      curveFactor,
+      pvGridTurnRadius
+    );
+    const batteryHomePath = this._makeCornerPath(
+      batteryNode.x,
+      batteryHomeStartY,
+      batteryHomeEndX,
+      homeNode.y,
+      0,
+      "H",
+      curvedLines,
+      curveFactor,
+      pvGridTurnRadius
+    );
+    const gridBatteryPath = curvedLines
+      ? `M${gridNode.x} ${gridNode.y} H${humpStartX} Q${humpCtrlInX} ${humpPeakY} ${homeCenterX} ${humpPeakY} Q${humpCtrlOutX} ${humpPeakY} ${humpEndX} ${gridNode.y} H${batteryNode.x}`
+      : `M${gridNode.x} ${gridNode.y} H${batteryNode.x}`;
+
+    const value = {
+      key,
+      curvedLines,
+      paths: {
+        pvGridPath,
+        pvBatteryPath,
+        gridHomePath,
+        batteryHomePath,
+        gridBatteryPath,
+      },
+      motionSpecs: {
+        "pv-grid": this._buildMotionSpecFromPathData(pvGridPath, true),
+        "pv-home": this._buildMotionSpecFromLine(pvNode.x, pvNode.y, homeNode.x, homeNode.y, false),
+        "pv-battery": this._buildMotionSpecFromPathData(pvBatteryPath, false),
+        "grid-home": this._buildMotionSpecFromPathData(gridHomePath, false),
+        "grid-battery": this._buildMotionSpecFromPathData(gridBatteryPath, false),
+        "battery-home": this._buildMotionSpecFromPathData(batteryHomePath, false),
+        "battery-grid": this._buildMotionSpecFromPathData(gridBatteryPath, true),
+      },
+      lineIdMap: {
+        "pv-grid": "line-pv-grid",
+        "pv-home": "line-pv-home",
+        "pv-battery": "line-pv-battery",
+        "grid-home": "line-grid-home",
+        "grid-battery": "arc-grid-battery",
+        "battery-home": "line-home-battery",
+        "battery-grid": "arc-grid-battery",
+      },
+      devicePositions: this._buildDeviceAnchorPositions(layout, deviceCount, homeRowYBase),
+    };
+
+    this._geometryCache = { key, value };
+    return value;
   }
 
   _getEntityConfig(kind) {
@@ -1722,30 +2271,11 @@ class CompactPowerCard extends (window.LitElement ||
   }
 
   _shouldUpdateForHass(hass) {
-    const themeMode = hass?.themes?.darkMode ?? null;
-    if (themeMode !== this._lastThemeMode) {
-      this._lastThemeMode = themeMode;
-      return true;
-    }
-
-    const ids = this._trackedEntityIds || new Set();
-    if (!ids.size) return true;
-
-    let changed = false;
-    for (const id of ids) {
-      const st = hass?.states?.[id];
-      const stamp = st ? `${st.last_changed}|${st.last_updated}` : "missing";
-      const prev = this._lastEntityStates.get(id);
-      if (prev !== stamp) {
-        this._lastEntityStates.set(id, stamp);
-        changed = true;
-      }
-    }
-    if (!changed) return false;
-
-    for (const id of Array.from(this._lastEntityStates.keys())) {
-      if (!ids.has(id)) this._lastEntityStates.delete(id);
-    }
+    const signature = this._buildVisibleStateSignature(hass);
+    if (signature === this._lastVisibleStateSignature) return false;
+    this._lastVisibleStateSignature = signature;
+    this._lastThemeMode = hass?.themes?.darkMode ?? null;
+    this._invalidateDerivedSnapshot();
     return true;
   }
 
@@ -2266,13 +2796,598 @@ class CompactPowerCard extends (window.LitElement ||
     return null;
   }
 
+  _getDerivedSnapshot() {
+    if (!this._config) return null;
+    if (this._derivedSnapshot && !this._derivedSnapshotDirty) {
+      return this._derivedSnapshot;
+    }
+    this._derivedSnapshot = this._buildDerivedSnapshot();
+    this._derivedSnapshotDirty = false;
+    return this._derivedSnapshot;
+  }
+
+  _buildDerivedSnapshot() {
+    const pvCfg = this._getEntityConfig("pv");
+    const hasPv =
+      this._config?.entities &&
+      Object.prototype.hasOwnProperty.call(this._config.entities, "pv");
+    const gridCfg = this._getEntityConfig("grid");
+    const homeCfg = this._getEntityConfig("home");
+    const batteryRaw = this._getEntityConfig("battery");
+    const batteryList = Array.isArray(batteryRaw)
+      ? batteryRaw
+      : batteryRaw
+      ? [batteryRaw]
+      : [{ entity: null }];
+    const batteryCfg = batteryList[0] || { entity: null };
+    const hasBattery =
+      this._config?.entities &&
+      Object.prototype.hasOwnProperty.call(this._config.entities, "battery") &&
+      batteryList.some((b) =>
+        Boolean(
+          b?.entity ||
+            b?.charge_entity ||
+            b?.discharge_entity ||
+            b?.chargeEntity ||
+            b?.dischargeEntity
+        )
+      );
+    const pvInBatterySlot = !hasBattery && Boolean(pvCfg?.entity);
+    const thresholdMode = String(this._config?.threshold_mode || "calculations").toLowerCase();
+    const useThresholdForCalc = thresholdMode === "calculations";
+    const invertGrid = Boolean(gridCfg?.invert_state_values);
+    const invertBattery = Boolean(batteryCfg?.invert_state_values);
+    const gridUsesDirectional =
+      Boolean(gridCfg?.import_entity || gridCfg?.export_entity || gridCfg?.importEntity || gridCfg?.exportEntity);
+    const invertGridEffective = invertGrid && !gridUsesDirectional;
+    const pvLabels = this._normalizeLabels(pvCfg?.labels, null);
+    const gridLabelsRaw = this._normalizeLabels(gridCfg?.labels, null);
+    const batteryLabelsSource = Array.isArray(this._config?.entities?.battery)
+      ? this._config?.entities?.battery_labels || this._config?.entities?.battery?.labels
+      : batteryCfg?.labels;
+    const batteryLabels = this._normalizeLabels(batteryLabelsSource, null);
+    const hasAnyLabels = pvLabels.length > 0 || gridLabelsRaw.length > 0 || batteryLabels.length > 0;
+    const { sources: normalizedSources, subtractFromHome } = this._getSourcesConfig();
+    const enableDevicePowerLines = this._useDevicePowerLines();
+    const allowGlow = this._allowGlowEffects();
+    const reducedPerformanceActive = this._isReducedPerformanceActive();
+
+    const layout = this._getLayoutMetrics({
+      hasPv,
+      hasBattery,
+      hasAnyLabels,
+    });
+    const pctBaseY = (v) => (layout.sy(v) / layout.viewHeight) * 100;
+    const pctHomeY = (v) => (layout.syHome(v) / layout.viewHeight) * 100;
+    const deviceYOffset = this._shouldUseExternalHeight() && layout.rowCount < 3 ? 20 : 0;
+    const homeRowYBase = 145 + deviceYOffset;
+
+    const pvUnitRaw =
+      this.hass?.states?.[pvCfg.entity]?.attributes?.unit_of_measurement || "";
+    const gridMeta = this._getGridPowerMeta(gridCfg, null);
+    const gridUnitRaw =
+      gridMeta?.unit ||
+      this.hass?.states?.[gridCfg.entity]?.attributes?.unit_of_measurement ||
+      "";
+    const batteryUnitRaw =
+      batteryList
+        .map((cfg) => this._getBatteryPowerMeta(cfg)?.unit ||
+          (cfg.entity && this.hass?.states?.[cfg.entity]?.attributes?.unit_of_measurement) || "")
+        .find((unit) => unit) || "";
+    const homeUnitRaw =
+      this.hass?.states?.[homeCfg.entity]?.attributes?.unit_of_measurement ||
+      "";
+
+    const applyThreshold = (value, threshold) => {
+      if (threshold == null) return value;
+      return Math.abs(value) < threshold ? 0 : value;
+    };
+
+    const pvThreshold = this._toWatts(this._parseThreshold(pvCfg.threshold), "W", true);
+    const gridThreshold = this._toWatts(this._parseThreshold(gridCfg.threshold), "W", true);
+    const batteryThreshold = null;
+    const homeThresholdDisplay = this._toWatts(this._parseThreshold(homeCfg.threshold), "W", true);
+    const batteryThresholdDisplay = this._toWatts(
+      this._parseThreshold(batteryCfg.threshold),
+      "W",
+      true
+    );
+
+    const pvMeta = this._getPowerMeta(pvCfg.entity, pvUnitRaw);
+    const homeMeta = this._getPowerMeta(homeCfg.entity, homeUnitRaw);
+    const batteryItems = batteryList.map((cfg) => {
+      const meta = this._getBatteryPowerMeta(cfg);
+      const unit =
+        meta?.unit ||
+        (cfg.entity && this.hass?.states?.[cfg.entity]?.attributes?.unit_of_measurement) ||
+        "";
+      const value = meta?.value != null ? meta.value : this._getNumeric(cfg.entity);
+      const watts = Number.isFinite(meta?.watts)
+        ? meta.watts
+        : this._toWatts(value, unit);
+      return { cfg, value, unit, watts };
+    });
+
+    const pvRawW = pvMeta.watts;
+    const pvCalcW = useThresholdForCalc ? applyThreshold(pvRawW, pvThreshold) : pvRawW;
+    const pv = Math.max(pvCalcW, 0);
+
+    const gridWatts = Number.isFinite(gridMeta?.watts) ? gridMeta.watts : 0;
+    const gridBaseW = invertGridEffective ? -gridWatts : gridWatts;
+    const batteryComputed = batteryItems.map((item) => {
+      const cfg = item.cfg || {};
+      const hasDirectional =
+        Boolean(cfg?.charge_entity || cfg?.discharge_entity || cfg?.chargeEntity || cfg?.dischargeEntity);
+      const invert = !hasDirectional && Boolean(cfg?.invert_state_values || invertBattery);
+      const threshold = this._toWatts(this._parseThreshold(cfg.threshold), "W", true);
+      const raw = invert ? -item.watts : item.watts;
+      const effective = useThresholdForCalc ? applyThreshold(raw, threshold) : raw;
+      return { cfg, raw, effective, threshold, unit: item.unit };
+    });
+
+    const batteryBaseW = batteryComputed.reduce((sum, item) => sum + item.effective, 0);
+    const grid = useThresholdForCalc ? applyThreshold(gridBaseW, gridThreshold) : gridBaseW;
+    const homeRawW = homeMeta.watts;
+
+    const pvFlow = Math.max(applyThreshold(pvRawW, pvThreshold), 0);
+    const gridFlow = applyThreshold(gridBaseW, gridThreshold);
+    const batteryFlow = applyThreshold(batteryBaseW, batteryThreshold);
+
+    let auxUsage = 0;
+    let hasPerDeviceInclude = false;
+    for (const src of normalizedSources) {
+      const entity = src.entity || null;
+      const attribute = src.attribute || null;
+      if (!this._isPowerDevice(entity)) continue;
+      const hasPerDeviceSubtract = Object.prototype.hasOwnProperty.call(src, "subtract_from_home");
+      const includeInHome = hasPerDeviceSubtract
+        ? this._coerceBoolean(src.subtract_from_home, subtractFromHome)
+        : subtractFromHome;
+      if (!includeInHome) continue;
+      if (hasPerDeviceSubtract && includeInHome) hasPerDeviceInclude = true;
+      const srcUnit =
+        this.hass?.states?.[entity]?.attributes?.unit_of_measurement ||
+        "";
+      const srcMeta = this._getPowerMeta(entity, srcUnit, attribute);
+      if (!Number.isFinite(srcMeta.watts)) continue;
+      const threshold = this._toWatts(this._parseThreshold(src.threshold), "W", true);
+      const valueForCalc = useThresholdForCalc ? applyThreshold(srcMeta.watts, threshold) : srcMeta.watts;
+      if (valueForCalc > 0) auxUsage += valueForCalc;
+    }
+
+    const hasHomeEntity = Boolean(homeCfg?.entity);
+    const baseHome = Number.isFinite(homeRawW) ? homeRawW : 0;
+    const inferredBase = pv + batteryBaseW - grid;
+    const allowSubtract = subtractFromHome || hasPerDeviceInclude;
+    let homeEffectiveDisplay = 0;
+    let homeEffectiveFlow = 0;
+    if (hasHomeEntity) {
+      const adjustedHome = allowSubtract ? baseHome - auxUsage : baseHome;
+      homeEffectiveDisplay = Math.max(adjustedHome, 0);
+      homeEffectiveFlow = Math.max(inferredBase, 0);
+    } else {
+      const inferredDisplay = Math.max(allowSubtract ? inferredBase - auxUsage : inferredBase, 0);
+      homeEffectiveDisplay = inferredDisplay;
+      homeEffectiveFlow = Math.max(inferredBase, 0);
+    }
+    this._homeEffective = homeEffectiveDisplay;
+    this._homeEffectiveUnit = "W";
+
+    const pvColor = this._getColor("pv", pvCfg);
+    const gridColor = this._getColor("grid", gridCfg);
+    const homeColor = this._getColor("home", homeCfg);
+    const batteryColor = this._getColor("battery", batteryCfg);
+
+    const inferredHomeUnit =
+      pvUnitRaw || gridUnitRaw || batteryUnitRaw || this._getUnitOverride(homeCfg) || "W";
+    const homeNumericW = this._toWatts(homeMeta.value, inferredHomeUnit);
+    const battNumericW = batteryBaseW;
+    const gridNumericW = gridBaseW;
+    const homeValueForOpacity = homeCfg?.entity ? homeNumericW : homeEffectiveDisplay;
+    const pvOpacity = this._opacityFor(pvRawW, pvThreshold);
+    const gridOpacity = this._opacityFor(gridNumericW, gridThreshold);
+    const homeOpacity = this._opacityFor(homeValueForOpacity, homeThresholdDisplay);
+    const batteryOpacity = this._opacityFor(battNumericW, batteryThresholdDisplay);
+    const pvLabelHidden = this._isBelowThreshold(pvRawW, pvThreshold);
+    const gridLabelHidden = this._isBelowThreshold(gridNumericW, gridThreshold);
+    const homeLabelHidden = this._isBelowThreshold(homeValueForOpacity, homeThresholdDisplay);
+    const batteryLabelHidden = this._isBelowThreshold(battNumericW, batteryThresholdDisplay);
+
+    const batterySocEntries = batteryList.map((cfg) => {
+      const soc = this._getBatterySocValue(cfg);
+      const rawCapacity = cfg?.battery_capacity;
+      const capacity =
+        rawCapacity == null
+          ? null
+          : Number.isFinite(rawCapacity)
+          ? rawCapacity
+          : Number.isFinite(parseFloat(rawCapacity))
+          ? parseFloat(rawCapacity)
+          : null;
+      return {
+        soc,
+        cap: capacity != null && capacity > 0 ? capacity : null,
+      };
+    });
+    const socValues = batterySocEntries.map((entry) => entry.soc).filter((value) => Number.isFinite(value));
+    const allHaveCap =
+      batterySocEntries.length > 0 &&
+      batterySocEntries.every((entry) => Number.isFinite(entry.soc) && Number.isFinite(entry.cap));
+    const batterySocPrimary = allHaveCap
+      ? (() => {
+          const totalCap = batterySocEntries.reduce((sum, entry) => sum + (entry.cap || 0), 0);
+          if (totalCap <= 0) return null;
+          const energy = batterySocEntries.reduce(
+            (sum, entry) => sum + (entry.cap || 0) * (entry.soc || 0) / 100,
+            0
+          );
+          return (energy / totalCap) * 100;
+        })()
+      : socValues.length > 0
+      ? socValues.reduce((sum, value) => sum + value, 0) / socValues.length
+      : null;
+    const batterySocDisplay = Boolean(batteryCfg?.show_soc) && Number.isFinite(batterySocPrimary)
+      ? Math.round(batterySocPrimary)
+      : null;
+    const batterySocEntity = batteryCfg?.show_soc ? this._getBatterySocEntity(batteryCfg) : null;
+
+    const deviceSourceBase = normalizedSources.map((src, idx) => {
+      const entity = src.entity || null;
+      const switchEntity = src.switch_entity || src.switchEntity || null;
+      const attribute = src.attribute || null;
+      const name = src.name || null;
+      const nameEntity = name && this.hass?.states?.[name] ? name : null;
+      const displayName = nameEntity ? this._formatEntityStateWithUnit(nameEntity) : name;
+      const icon = src.icon || this._getEntityIcon(entity, "mdi:power-plug");
+      const isPowerDevice = this._isPowerDevice(entity);
+      const st = entity ? this.hass?.states?.[entity] : null;
+      const raw = attribute ? st?.attributes?.[attribute] : st?.state;
+      const isUnavailable = this._isUnavailableState(raw);
+      const numeric = isUnavailable ? 0 : this._getNumericMaybe(entity, attribute);
+      const unit = st?.attributes?.unit_of_measurement || "";
+      const decimals = this._getDecimalPlaces(src);
+      const numericW = isUnavailable ? 0 : this._toWatts(numeric, unit, true);
+      const hasNumeric = isUnavailable ? true : Number.isFinite(numericW);
+      const unitOverride = this._getUnitOverride(src);
+      const value = hasNumeric
+        ? this._formatPowerWithOverride(numericW, decimals, "W", unitOverride ?? null)
+        : this._formatEntity(entity, decimals, attribute, unitOverride);
+      const threshold = this._toWatts(this._parseThreshold(src.threshold), "W", true);
+      const opacity = hasNumeric ? this._opacityFor(numericW, threshold) : 1;
+      const hidden =
+        (hasNumeric && this._isBelowThreshold(numericW, threshold)) ||
+        (this._coerceBoolean(src.force_hide_under_threshold, false) && numericW === 0);
+      const forceHideUnderThreshold = this._coerceBoolean(src.force_hide_under_threshold, false);
+      let switchOn = false;
+      if (isPowerDevice && switchEntity) {
+        const switchState = this.hass?.states?.[switchEntity]?.state;
+        switchOn = String(switchState || "").toLowerCase() === "on";
+      }
+      return {
+        sourceIndex: idx,
+        entity,
+        switchEntity,
+        switchOn,
+        name: displayName,
+        icon,
+        val: value,
+        color: src.color || homeColor,
+        opacity,
+        hidden,
+        numeric: hasNumeric ? numericW : 0,
+        isPowerDevice,
+        threshold,
+        forceHideUnderThreshold,
+      };
+    });
+
+    const visibleSources = deviceSourceBase.filter(
+      (src) => !(src.forceHideUnderThreshold && src.hidden)
+    );
+    const renderedDeviceCount = Math.min(visibleSources.length, layout.maxItemsByColumns);
+    const geometry = this._getGeometryBundle(layout, {
+      deviceCount: renderedDeviceCount,
+      homeRowYBase,
+    });
+    const sourcePositions = geometry.devicePositions;
+    const deviceSources = visibleSources.slice(0, sourcePositions.length).map((src, idx) => {
+      const pos = sourcePositions[idx] || { x: layout.homeCenterX, y: homeRowYBase, leftPct: 50 };
+      const key = src.entity || `idx-${src.sourceIndex}`;
+      const active = src.isPowerDevice
+        ? src.switchEntity
+          ? src.switchOn
+          : src.numeric > 0 && !src.hidden
+        : false;
+      return {
+        ...src,
+        key,
+        pos,
+        leftPct: pos.leftPct != null ? pos.leftPct : (pos.x / layout.baseWidth) * 100,
+        topPct: pctHomeY(pos.y),
+        active,
+      };
+    });
+
+    const deviceUsageWatts = deviceSources.reduce((total, src) => {
+      if (!src?.isPowerDevice) return total;
+      return total + (src.hidden ? 0 : Math.max(src.numeric ?? 0, 0));
+    }, 0);
+    const deviceUsageActive = deviceUsageWatts > 0;
+    const pulseMinSeconds = 0.6;
+    const pulseMaxSeconds = 2.2;
+    const pulseMaxWatts = 5000;
+    const pulseT = Math.min(deviceUsageWatts, pulseMaxWatts) / pulseMaxWatts;
+    const devicePulseSeconds = pulseMaxSeconds - (pulseMaxSeconds - pulseMinSeconds) * pulseT;
+    const deviceJunctionTopPct = pctHomeY(homeRowYBase + 26);
+    const deviceLineBases = enableDevicePowerLines
+      ? sourcePositions
+          .map((pos, idx) => {
+            const src = deviceSources[idx];
+            if (!src?.isPowerDevice) return null;
+            const active = Boolean(src.active);
+            const startY = layout.syHome(homeRowYBase + 22);
+            return {
+              key: src.key || src.entity || `idx-${idx}`,
+              active,
+              color: homeColor,
+              opacity: active ? 1 : 0.1,
+              idx,
+              startX: pos.x,
+              startY,
+              downY: startY + 8,
+              upY: startY + 4,
+              homeX: layout.homeNode.x,
+              dashed: !active,
+            };
+          })
+          .filter(Boolean)
+      : [];
+
+    const threshold = 0;
+    const gridImportThreshold = 0;
+    const baseDuration = 1500;
+    const activeFlows = {};
+    const gridImport = gridFlow < 0 ? -gridFlow : 0;
+    const gridExport = gridFlow > 0 ? gridFlow : 0;
+    const battDischarge = batteryFlow > 0 ? batteryFlow : 0;
+    const battCharge = batteryFlow < 0 ? -batteryFlow : 0;
+    let homeNeed = Math.max(homeEffectiveFlow, 0);
+    let chargeNeed = battCharge;
+    const forceCharge = battCharge > 0 && gridImport > 0;
+
+    let pvToHome = 0;
+    let pvToBattery = 0;
+    let pvToGrid = 0;
+
+    if (forceCharge) {
+      pvToBattery = Math.min(pvFlow, chargeNeed);
+      chargeNeed -= pvToBattery;
+      let pvRemaining = pvFlow - pvToBattery;
+      pvToHome = Math.min(pvRemaining, homeNeed);
+      homeNeed -= pvToHome;
+      pvRemaining -= pvToHome;
+      pvToGrid = Math.min(pvRemaining, gridExport);
+    } else {
+      pvToHome = Math.min(pvFlow, homeNeed);
+      homeNeed -= pvToHome;
+      let pvRemaining = pvFlow - pvToHome;
+      pvToBattery = Math.min(pvRemaining, chargeNeed);
+      pvRemaining -= pvToBattery;
+      chargeNeed -= pvToBattery;
+      pvToGrid = Math.min(pvRemaining, gridExport);
+    }
+
+    const batteryToHome = Math.min(battDischarge, homeNeed);
+    homeNeed -= batteryToHome;
+    const battDischargeAfterHome = Math.max(battDischarge - batteryToHome, 0);
+    const batteryToGrid = Math.min(battDischargeAfterHome, Math.max(gridExport - pvToGrid, 0));
+    const gridToHome = Math.min(gridImport, homeNeed);
+    homeNeed -= gridToHome;
+    const gridImportRemaining = Math.max(gridImport - gridToHome, 0);
+    const gridToBattery = Math.min(gridImportRemaining, chargeNeed);
+
+    const pvHomeKey = pvInBatterySlot ? "battery-home" : "pv-home";
+    const pvGridKey = pvInBatterySlot ? "battery-grid" : "pv-grid";
+    if (pvToHome > threshold) {
+      activeFlows[pvHomeKey] = { magnitude: pvToHome, color: pvColor };
+    }
+    if (!pvInBatterySlot && pvToBattery > threshold) {
+      activeFlows["pv-battery"] = { magnitude: pvToBattery, color: pvColor };
+    }
+    if (pvToGrid > threshold) {
+      activeFlows[pvGridKey] = { magnitude: pvToGrid, color: pvColor };
+    }
+    if (gridToHome > gridImportThreshold) {
+      activeFlows["grid-home"] = { magnitude: gridToHome, color: gridColor };
+    }
+    if (gridToBattery > gridImportThreshold) {
+      activeFlows["grid-battery"] = { magnitude: gridToBattery, color: gridColor };
+    }
+    if (batteryToHome > threshold) {
+      activeFlows["battery-home"] = { magnitude: batteryToHome, color: batteryColor };
+    }
+    if (batteryToGrid > threshold) {
+      activeFlows["battery-grid"] = { magnitude: batteryToGrid, color: batteryColor };
+    }
+    if (
+      battDischarge > threshold &&
+      !activeFlows["battery-home"] &&
+      !activeFlows["battery-grid"]
+    ) {
+      activeFlows["battery-home"] = {
+        magnitude: battDischarge,
+        color: batteryColor,
+      };
+    }
+
+    const allFlowNames = [
+      "pv-home",
+      "pv-battery",
+      "pv-grid",
+      "grid-home",
+      "grid-battery",
+      "battery-home",
+      "battery-grid",
+    ];
+    let maxFlow = 0;
+    for (const flow of Object.values(activeFlows)) {
+      if (flow.magnitude > maxFlow) maxFlow = flow.magnitude;
+    }
+
+    const flowEntries = {};
+    for (const name of allFlowNames) {
+      const meta = activeFlows[name];
+      if (!meta || maxFlow <= 0) {
+        flowEntries[name] = null;
+        continue;
+      }
+      const motionSpec = geometry.motionSpecs[name];
+      if (!motionSpec) {
+        flowEntries[name] = null;
+        continue;
+      }
+      const rawRatio = maxFlow / meta.magnitude;
+      const factor = Math.min(Math.max(rawRatio, 1), 4);
+      flowEntries[name] = {
+        ...meta,
+        lineId: geometry.lineIdMap[name] || null,
+        motionSpec,
+        duration: baseDuration * factor,
+      };
+    }
+
+    const flowSignature = [
+      ...allFlowNames.map((name) => {
+        const meta = flowEntries[name];
+        if (!meta) return `${name}:off`;
+        const motionSignature = `${meta.motionSpec.offsetPath}|${meta.motionSpec.reverse ? 1 : 0}`;
+        return `${name}:${meta.color}:${meta.duration}:${meta.magnitude.toFixed(3)}:${motionSignature}`;
+      }),
+      `reduced=${reducedPerformanceActive ? 1 : 0}`,
+    ].join("|");
+
+    return {
+      reducedPerformanceActive,
+      allowGlow,
+      enableDevicePowerLines,
+      pvCfg,
+      gridCfg,
+      homeCfg,
+      batteryCfg,
+      batteryList,
+      batteryLabelsSource,
+      normalizedSources,
+      hasPv,
+      hasBattery,
+      pvInBatterySlot,
+      hasAnyLabels,
+      pvLabels,
+      gridLabelsRaw,
+      batteryLabels,
+      layout,
+      geometry,
+      units: {
+        pvUnitRaw,
+        gridUnitRaw,
+        batteryUnitRaw,
+        homeUnitRaw,
+      },
+      colors: {
+        pvColor,
+        gridColor,
+        homeColor,
+        batteryColor,
+      },
+      power: {
+        pvMeta,
+        gridMeta,
+        homeMeta,
+        homeRawW,
+        homeNumericW,
+        homeEffectiveW: homeEffectiveDisplay,
+        homeEffectiveFlow,
+        gridNumericW,
+        battNumericW,
+        batteryItems,
+        batteryComputed,
+        pvRawW,
+      },
+      thresholds: {
+        pvThreshold,
+        gridThreshold,
+        batteryThresholdDisplay,
+        homeThresholdDisplay,
+      },
+      display: {
+        pvOpacity,
+        gridOpacity,
+        homeOpacity,
+        batteryOpacity,
+        pvLabelHidden,
+        gridLabelHidden,
+        homeLabelHidden,
+        batteryLabelHidden,
+        homeValueForOpacity,
+        gridArrow:
+          gridNumericW > 0
+            ? "mdi:arrow-left"
+            : gridNumericW < 0
+            ? "mdi:arrow-right"
+            : null,
+        battArrow:
+          battNumericW > 0
+            ? "mdi:arrow-left"
+            : battNumericW < 0
+            ? "mdi:arrow-right"
+            : null,
+      },
+      batterySoc: {
+        entries: batterySocEntries,
+        primary: batterySocPrimary,
+        display: batterySocDisplay,
+        entity: batterySocEntity,
+      },
+      device: {
+        showDeviceNames: layout.rowCount >= 4,
+        homeRowYBase,
+        sources: deviceSources,
+        lineBases: deviceLineBases,
+        hasDeviceSources: deviceSources.length > 0,
+        deviceUsageWatts,
+        deviceUsageActive,
+        devicePulseSeconds,
+        deviceJunctionTopPct,
+      },
+      flows: {
+        allNames: allFlowNames,
+        active: flowEntries,
+        gradient: {
+          pvToHome,
+          batteryToHome,
+          gridToHome,
+          pvColor,
+          batteryColor,
+          gridColor,
+          homeColor,
+        },
+      },
+      flowSignature,
+    };
+  }
+
   _setLineColor(lineId, color, active = false) {
     const el = this.shadowRoot?.getElementById(lineId);
     if (!el) return;
-    el.style.stroke = color;
-    el.style.strokeOpacity = active ? "1" : "0.15";
     const allowGlow = this._allowGlowEffects();
-    el.style.filter = active && allowGlow ? `drop-shadow(0 0 6px ${color})` : "none";
+    const strokeOpacity = active ? "1" : "0.15";
+    const filter = active && allowGlow ? `drop-shadow(0 0 6px ${color})` : "none";
+    const signature = `${color}|${strokeOpacity}|${filter}`;
+    const cached = this._lineStyleCache.get(lineId);
+    if (cached?.element === el && cached.signature === signature) return;
+    el.style.stroke = color;
+    el.style.strokeOpacity = strokeOpacity;
+    el.style.filter = filter;
+    this._lineStyleCache.set(lineId, { element: el, signature });
   }
 
   _setHomeGradient(pvToHome, batteryToHome, gridToHome, pvColor, batteryColor, gridColor, homeColor) {
@@ -2442,192 +3557,15 @@ class CompactPowerCard extends (window.LitElement ||
     setStops(targetStops);
   }
 
-  _updateFlows() {
-    if (!this._config || !this.hass) return;
+  _updateFlows(snapshot = null) {
+    const derived = snapshot || this._renderState?.snapshot || this._getDerivedSnapshot();
+    if (!derived) return;
     if (!this.shadowRoot) {
       this._pendingFlowUpdate = true;
       return;
     }
-    
-    const pvCfg = this._getEntityConfig("pv");
-    const gridCfg = this._getEntityConfig("grid");
-    const homeCfg = this._getEntityConfig("home");
-    const batteryRaw = this._getEntityConfig("battery");
-    const batteryList = Array.isArray(batteryRaw)
-      ? batteryRaw
-      : batteryRaw
-      ? [batteryRaw]
-      : [{ entity: null }];
-    const batteryCfg = batteryList[0] || { entity: null };
-    const hasBattery =
-      this._config?.entities &&
-      Object.prototype.hasOwnProperty.call(this._config.entities, "battery") &&
-      batteryList.some((b) =>
-        Boolean(
-          b?.entity ||
-            b?.charge_entity ||
-            b?.discharge_entity ||
-            b?.chargeEntity ||
-            b?.dischargeEntity
-        )
-      );
-    const pvInBatterySlot = !hasBattery && Boolean(pvCfg?.entity);
-    const thresholdMode = String(this._config?.threshold_mode || "calculations").toLowerCase();
-    const useThresholdForCalc = thresholdMode === "calculations";
-    const invertGrid = Boolean(gridCfg?.invert_state_values);
-    const invertBattery = Boolean(batteryCfg?.invert_state_values);
-    const gridUsesDirectional =
-      Boolean(gridCfg?.import_entity || gridCfg?.export_entity || gridCfg?.importEntity || gridCfg?.exportEntity);
-    const invertGridEffective = invertGrid && !gridUsesDirectional;
-    const pvLabels = this._normalizeLabels(pvCfg?.labels, null);
-    const gridLabelsRaw = this._normalizeLabels(gridCfg?.labels, null);
-    const batteryLabelsSource = Array.isArray(this._config?.entities?.battery)
-      ? this._config?.entities?.battery_labels || this._config?.entities?.battery?.labels
-      : batteryCfg?.labels;
-    const batteryLabels = this._normalizeLabels(batteryLabelsSource, null);
-    const hasAnyLabels = pvLabels.length > 0 || gridLabelsRaw.length > 0 || batteryLabels.length > 0;
-    const pvUnit =
-      this.hass?.states?.[pvCfg.entity]?.attributes?.unit_of_measurement ||
-      "";
-    const curvedLines = this._useCurvedLines();
-    const gridUnit =
-      this.hass?.states?.[gridCfg.entity]?.attributes?.unit_of_measurement ||
-      "";
-    const batteryUnit =
-      this.hass?.states?.[batteryCfg.entity]?.attributes?.unit_of_measurement ||
-      "";
-    const homeUnit =
-      this.hass?.states?.[homeCfg.entity]?.attributes?.unit_of_measurement ||
-      "";
 
-    const applyThreshold = (value, threshold) => {
-      if (threshold == null) return value;
-      return Math.abs(value) < threshold ? 0 : value;
-    };
-
-    const pvThreshold = this._toWatts(this._parseThreshold(pvCfg.threshold), "W", true);
-    const gridThreshold = this._toWatts(this._parseThreshold(gridCfg.threshold), "W", true);
-    const batteryThreshold = null; // thresholds applied per battery above
-
-    const pvMeta = this._getPowerMeta(pvCfg.entity, pvUnit);
-    const gridMeta = this._getGridPowerMeta(gridCfg, gridUnit);
-    let batteryComputed = [];
-    const batteryItems = batteryList.map((b) => {
-      const meta = this._getBatteryPowerMeta(b);
-      const unit =
-        meta?.unit ||
-        (b.entity && this.hass?.states?.[b.entity]?.attributes?.unit_of_measurement) ||
-        "";
-      const value = meta?.value != null ? meta.value : this._getNumeric(b.entity);
-      const watts = Number.isFinite(meta?.watts)
-        ? meta.watts
-        : this._toWatts(value, unit);
-      return { cfg: b, value, unit, watts };
-    });
-    const homeMeta = this._getPowerMeta(homeCfg.entity, homeUnit);
-
-    const pvRawW = pvMeta.watts;
-    const pvCalcW = useThresholdForCalc ? applyThreshold(pvRawW, pvThreshold) : pvRawW;
-    const pv = Math.max(pvCalcW, 0);
-
-    const gridWatts = Number.isFinite(gridMeta?.watts) ? gridMeta.watts : 0;
-    const gridBaseW = invertGridEffective ? -gridWatts : gridWatts;
-    batteryComputed = batteryItems.map((item) => {
-      const cfg = item.cfg || {};
-      const hasDirectional =
-        Boolean(cfg?.charge_entity || cfg?.discharge_entity || cfg?.chargeEntity || cfg?.dischargeEntity);
-      const invert = !hasDirectional && Boolean(cfg?.invert_state_values || invertBattery);
-      const thr = this._toWatts(this._parseThreshold(cfg.threshold), "W", true);
-      const raw = invert ? -item.watts : item.watts;
-      const effective = useThresholdForCalc ? applyThreshold(raw, thr) : raw;
-      return { cfg, raw, effective, threshold: thr, unit: item.unit };
-    });
-
-    const batteryBaseW = batteryComputed.reduce((sum, item) => sum + item.effective, 0);
-    const batteryBaseRawW = batteryComputed.reduce((sum, item) => sum + item.raw, 0);
-
-    const grid = useThresholdForCalc ? applyThreshold(gridBaseW, gridThreshold) : gridBaseW;
-    const homeRawW = homeMeta.watts;
-    const battery = batteryBaseW;
-
-    // Flows always respect thresholds for visibility/animation
-    const pvFlow = Math.max(applyThreshold(pvRawW, pvThreshold), 0);
-    const gridFlow = applyThreshold(gridBaseW, gridThreshold);
-    const batteryFlow = applyThreshold(batteryBaseW, batteryThreshold);
-
-    const { sources: normalizedSources, subtractFromHome } = this._getSourcesConfig();
-
-    let auxUsage = 0;
-    let hasPerDeviceInclude = false;
-    for (const src of normalizedSources) {
-      const entity = src.entity || null;
-      const attribute = src.attribute || null;
-      if (!this._isPowerDevice(entity)) continue;
-      const hasPerDeviceSubtract = Object.prototype.hasOwnProperty.call(src, "subtract_from_home");
-      const includeInHome = hasPerDeviceSubtract
-        ? this._coerceBoolean(src.subtract_from_home, subtractFromHome)
-        : subtractFromHome;
-      if (!includeInHome) continue;
-      if (hasPerDeviceSubtract && includeInHome) hasPerDeviceInclude = true;
-      const srcUnit =
-        this.hass?.states?.[entity]?.attributes?.unit_of_measurement ||
-        "";
-      const srcMeta = this._getPowerMeta(entity, srcUnit, attribute);
-      if (!Number.isFinite(srcMeta.watts)) continue;
-      const thr = this._toWatts(this._parseThreshold(src.threshold), "W", true);
-      const valForCalc = useThresholdForCalc ? applyThreshold(srcMeta.watts, thr) : srcMeta.watts;
-      if (valForCalc > 0) auxUsage += valForCalc;
-    }
-
-    const hasHomeEntity = Boolean(homeCfg?.entity);
-    const baseHome = Number.isFinite(homeRawW) ? homeRawW : 0;
-    const inferredBase = pv + battery - grid;
-    const allowSubtract = subtractFromHome || hasPerDeviceInclude;
-    let homeEffectiveDisplay = 0;
-    let homeEffectiveFlow = 0;
-    if (hasHomeEntity) {
-      const adjustedHome = allowSubtract ? baseHome - auxUsage : baseHome;
-      homeEffectiveDisplay = Math.max(adjustedHome, 0);
-      homeEffectiveFlow = Math.max(inferredBase, 0);
-    } else {
-      const inferredDisplay = Math.max(allowSubtract ? inferredBase - auxUsage : inferredBase, 0);
-      homeEffectiveDisplay = inferredDisplay;
-      homeEffectiveFlow = Math.max(inferredBase, 0);
-    }
-    this._homeEffective = homeEffectiveDisplay;
-    this._homeEffectiveUnit = "W";
-
-    const pvColor = this._getColor("pv", pvCfg);
-    const gridColor = this._getColor("grid", gridCfg);
-    const homeColor = this._getColor("home", homeCfg);
-    const batteryColor = this._getColor("battery", batteryCfg);
-
-    const threshold = 0;
-    const gridImportThreshold = 0;
-    const baseDuration = 1500;
-
-    const parseLineGeom = (id, fallback, reverse = false) => {
-      const el = this.shadowRoot?.getElementById(id);
-      if (!el) return fallback;
-      const x1 = Number(el.getAttribute("x1"));
-      const y1 = Number(el.getAttribute("y1"));
-      const x2 = Number(el.getAttribute("x2"));
-      const y2 = Number(el.getAttribute("y2"));
-      if ([x1, y1, x2, y2].every((v) => Number.isFinite(v))) {
-        if (reverse) {
-          return { mode: "line", x1: x2, y1: y2, x2: x1, y2: y1 };
-        }
-        return { mode: "line", x1, y1, x2, y2 };
-      }
-      return fallback;
-    };
-
-    const parsePathGeom = (id, fallback, reverse = false) => {
-      const el = this.shadowRoot?.getElementById(id);
-      if (!el || !el.getTotalLength) return fallback;
-      return { mode: "path", pathId: id, fallback, reverse };
-    };
-
+    const { pvColor, gridColor, batteryColor, homeColor } = derived.colors;
     const allLines = [
       "line-pv-grid",
       "line-pv-home",
@@ -2641,314 +3579,40 @@ class CompactPowerCard extends (window.LitElement ||
       "line-pv-home": pvColor,
       "line-pv-battery": pvColor,
       "line-grid-home": gridColor,
-      "line-home-battery": pvInBatterySlot ? pvColor : batteryColor,
-      "arc-grid-battery": pvInBatterySlot ? pvColor : gridColor,
+      "line-home-battery": derived.pvInBatterySlot ? pvColor : batteryColor,
+      "arc-grid-battery": derived.pvInBatterySlot ? pvColor : gridColor,
     };
-    for (const id of allLines) {
-      const baseColor = lineBaseColors[id] || "#7a7a7a";
-      this._setLineColor(id, baseColor, false);
+    const activeLineIds = new Set(
+      Object.values(derived.flows?.active || {})
+        .map((meta) => meta?.lineId || null)
+        .filter(Boolean)
+    );
+    for (const lineId of allLines) {
+      if (activeLineIds.has(lineId)) continue;
+      this._setLineColor(lineId, lineBaseColors[lineId] || "#7a7a7a", false);
     }
 
-    // Geometry helpers consistent with render()
-    const layout = this._getLayoutMetrics({
-      hasPv:
-        this._config?.entities &&
-        Object.prototype.hasOwnProperty.call(this._config.entities, "pv"),
-      hasBattery,
-      hasAnyLabels,
-    });
-    const {
-      baseWidth,
-      renderScaleY,
-      homeCenterX,
-      pvNodeY,
-      homeAnchorY,
-      homeLineEndY,
-      gridLineStartX,
-      gridLineEndX,
-      gridNodeY,
-      gridPvStartY,
-      humpWidth,
-      humpHeightAdj,
-      humpStartX,
-      humpEndX,
-      humpPeakY,
-      humpCtrlInX,
-      humpCtrlOutX,
-      pvGridEndX,
-      pvGridTurnRadius,
-      pvBatteryStartX,
-      pvBatteryEndY,
-      gridHomeStartY,
-      gridHomeEndX,
-      batteryHomeStartY,
-      batteryHomeEndX,
-      pvNode,
-      gridNode,
-      batteryNode,
-      homeNode,
-    } = layout;
-    const gridBatteryCtrlX = baseWidth / 2; // keep hump centered near home/PV line
-    const gridBatteryCtrlY = gridNodeY - humpHeightAdj; // fixed hump height (screen px)
-
-    // Straight-line geometry between anchor points
-    const gridBatteryGeom = curvedLines
-      ? {
-          mode: "path",
-          pathId: "arc-grid-battery",
-          fallback: { mode: "line", x1: gridNode.x, y1: gridNode.y, x2: batteryNode.x, y2: batteryNode.y },
-          ctrlX: gridBatteryCtrlX,
-          ctrlY: gridBatteryCtrlY,
-        }
-      : { mode: "line", x1: gridNode.x, y1: gridNode.y, x2: batteryNode.x, y2: batteryNode.y };
-    const batteryGridGeom = curvedLines
-      ? {
-          mode: "path",
-          pathId: "arc-grid-battery",
-          fallback: { mode: "line", x1: batteryNode.x, y1: batteryNode.y, x2: gridNode.x, y2: gridNode.y },
-          ctrlX: gridBatteryCtrlX,
-          ctrlY: gridBatteryCtrlY,
-        }
-      : { mode: "line", x1: batteryNode.x, y1: batteryNode.y, x2: gridNode.x, y2: gridNode.y };
-
-    const geom = {
-      // Grid → PV: right angle (horizontal then vertical), same anchors
-      "pv-grid": {
-        mode: "path",
-        pathId: "line-pv-grid",
-        fallback: { mode: "line", x1: gridNode.x, y1: gridPvStartY, x2: pvGridEndX, y2: pvNode.y },
-      },
-      "pv-home": { mode: "line", x1: pvNode.x, y1: pvNode.y, x2: homeNode.x, y2: homeNode.y },
-      // PV → Battery: right angle (horizontal then vertical), same anchors
-      "pv-battery": {
-        mode: "path",
-        pathId: "line-pv-battery",
-        fallback: { mode: "line", x1: pvBatteryStartX, y1: pvNode.y, x2: batteryNode.x, y2: pvBatteryEndY },
-      },
-
-      // Grid → Home: right angle (horizontal then vertical), same anchors
-      "grid-home": {
-        mode: "path",
-        pathId: "line-grid-home",
-        fallback: { mode: "line", x1: gridNode.x, y1: gridHomeStartY, x2: gridHomeEndX, y2: homeNode.y },
-      },
-      // Battery → Home: right angle (horizontal then vertical), same anchors
-      "battery-home": {
-        mode: "path",
-        pathId: "line-home-battery",
-        fallback: { mode: "line", x1: batteryNode.x, y1: batteryHomeStartY, x2: batteryHomeEndX, y2: homeNode.y },
-      },
-
-      "grid-battery": gridBatteryGeom,
-      "battery-grid": batteryGridGeom,
-    };
-
-    // Let flow dots follow the current drawn geometry (lines/paths) when updated.
-    geom["pv-grid"] = parsePathGeom(
-      "line-pv-grid",
-      { mode: "line", x1: gridNode.x, y1: gridPvStartY, x2: pvGridEndX, y2: pvNode.y },
-      true
-    );
-    geom["pv-battery"] = parsePathGeom(
-      "line-pv-battery",
-      { mode: "line", x1: pvBatteryStartX, y1: pvNode.y, x2: batteryNode.x, y2: pvBatteryEndY },
-      false
-    );
-    geom["pv-home"] = parseLineGeom("line-pv-home", geom["pv-home"]);
-    geom["grid-battery"] = curvedLines
-      ? parsePathGeom(
-          "arc-grid-battery",
-          {
-            mode: "quad",
-            x0: gridNode.x,
-            y0: gridNode.y,
-            cx: gridBatteryCtrlX,
-            cy: gridBatteryCtrlY,
-            x1: batteryNode.x,
-            y1: batteryNode.y,
-          },
-          false
-        )
-      : gridBatteryGeom;
-    geom["battery-grid"] = curvedLines
-      ? parsePathGeom(
-          "arc-grid-battery",
-          {
-            mode: "quad",
-            x0: batteryNode.x,
-            y0: batteryNode.y,
-            cx: gridBatteryCtrlX,
-            cy: gridBatteryCtrlY,
-            x1: gridNode.x,
-            y1: gridNode.y,
-          },
-          true
-        )
-      : batteryGridGeom;
-    geom["grid-home"] = parsePathGeom(
-      "line-grid-home",
-      { mode: "line", x1: gridNode.x, y1: gridHomeStartY, x2: gridHomeEndX, y2: homeNode.y },
-      false
-    );
-    geom["battery-home"] = parsePathGeom(
-      "line-home-battery",
-      { mode: "line", x1: batteryNode.x, y1: batteryHomeStartY, x2: batteryHomeEndX, y2: homeNode.y },
-      false
-    );
-
-    const lineIdMap = {
-      "pv-grid": "line-pv-grid",
-      "pv-home": "line-pv-home",
-      "pv-battery": "line-pv-battery",
-      "grid-home": "line-grid-home",
-      "battery-home": "line-home-battery",
-      "grid-battery": "arc-grid-battery",
-      "battery-grid": "arc-grid-battery",
-    };
-
-    const active = {};
-
-    // Flow priorities (see Power Flow Rules):
-    // PV: home → battery (charge) → export
-    // Battery (discharge): home → export
-    // Grid (import): home → battery (charge), only after PV/battery
-    const gridImport = gridFlow < 0 ? -gridFlow : 0;
-    const gridExport = gridFlow > 0 ? gridFlow : 0;
-    const battDischarge = batteryFlow > 0 ? batteryFlow : 0;
-    const battCharge = batteryFlow < 0 ? -batteryFlow : 0;
-
-    let homeNeed = Math.max(homeEffectiveFlow, 0);
-    let chargeNeed = battCharge;
-
-    const forceCharge = battCharge > 0 && gridImport > 0;
-
-    let pvToHome = 0;
-    let pvToBattery = 0;
-    let pvToGrid = 0;
-
-    if (forceCharge) {
-      // Forced charge: PV charges battery before serving home.
-      pvToBattery = Math.min(pvFlow, chargeNeed);
-      chargeNeed -= pvToBattery;
-      let pvRemaining = pvFlow - pvToBattery;
-      pvToHome = Math.min(pvRemaining, homeNeed);
-      homeNeed -= pvToHome;
-      pvRemaining -= pvToHome;
-      pvToGrid = Math.min(pvRemaining, gridExport);
-    } else {
-      // PV → home, then battery charge, then export
-      pvToHome = Math.min(pvFlow, homeNeed);
-      homeNeed -= pvToHome;
-      let pvRemaining = pvFlow - pvToHome;
-      pvToBattery = Math.min(pvRemaining, chargeNeed);
-      pvRemaining -= pvToBattery;
-      chargeNeed -= pvToBattery;
-      pvToGrid = Math.min(pvRemaining, gridExport);
-    }
-
-    // Battery discharge → remaining home, then export (only what PV export didn't cover)
-    const batteryToHome = Math.min(battDischarge, homeNeed);
-    homeNeed -= batteryToHome;
-    const battDischargeAfterHome = Math.max(battDischarge - batteryToHome, 0);
-    const batteryToGrid = Math.min(battDischargeAfterHome, Math.max(gridExport - pvToGrid, 0));
-
-    // Grid import → remaining home, then remaining battery charge
-    const gridToHome = Math.min(gridImport, homeNeed);
-    homeNeed -= gridToHome;
-    const gridImportRemaining = Math.max(gridImport - gridToHome, 0);
-    const gridToBattery = Math.min(gridImportRemaining, chargeNeed);
-    chargeNeed -= gridToBattery;
-
+    const gradient = derived.flows?.gradient || {};
     this._setHomeGradient(
-      pvToHome,
-      batteryToHome,
-      gridToHome,
-      pvColor,
-      batteryColor,
-      gridColor,
-      homeColor
+      gradient.pvToHome || 0,
+      gradient.batteryToHome || 0,
+      gradient.gridToHome || 0,
+      gradient.pvColor || pvColor,
+      gradient.batteryColor || batteryColor,
+      gradient.gridColor || gridColor,
+      gradient.homeColor || homeColor
     );
 
-    const pvHomeKey = pvInBatterySlot ? "battery-home" : "pv-home";
-    const pvGridKey = pvInBatterySlot ? "battery-grid" : "pv-grid";
-    if (pvToHome > threshold)
-      active[pvHomeKey] = { geom: geom[pvHomeKey], magnitude: pvToHome, color: pvColor };
-    if (!pvInBatterySlot && pvToBattery > threshold)
-      active["pv-battery"] = { geom: geom["pv-battery"], magnitude: pvToBattery, color: pvColor };
-    if (pvToGrid > threshold)
-      active[pvGridKey] = { geom: geom[pvGridKey], magnitude: pvToGrid, color: pvColor };
-
-    if (gridToHome > gridImportThreshold)
-      active["grid-home"] = {
-        geom: geom["grid-home"],
-        magnitude: gridToHome,
-        color: gridColor,
-      };
-    if (gridToBattery > gridImportThreshold)
-      active["grid-battery"] = {
-        geom: geom["grid-battery"],
-        magnitude: gridToBattery,
-        color: gridColor,
-      };
-
-    if (batteryToHome > threshold)
-      active["battery-home"] = {
-        geom: geom["battery-home"],
-        magnitude: batteryToHome,
-        color: batteryColor,
-      };
-    if (batteryToGrid > threshold)
-      active["battery-grid"] = {
-        geom: geom["battery-grid"],
-        magnitude: batteryToGrid,
-        color: batteryColor,
-      };
-
-    // Fallback: if battery is discharging but no line was activated (PV/grid covered needs),
-    // still show a battery → home flow so discharge is visible.
-    if (
-      battDischarge > threshold &&
-      !active["battery-home"] &&
-      !active["battery-grid"]
-    ) {
-      active["battery-home"] = {
-        geom: geom["battery-home"],
-        magnitude: battDischarge,
-        color: batteryColor,
-      };
-    }
-
-
-    let maxFlow = 0;
-    for (const f of Object.values(active)) {
-      if (f.magnitude > maxFlow) maxFlow = f.magnitude;
-    }
-    if (maxFlow <= 0) maxFlow = 0;
-
-    const allNames = [
-      "pv-home",
-      "pv-battery",
-      "pv-grid",
-      "grid-home",
-      "grid-battery",
-      "battery-home",
-      "battery-grid",
-    ];
-
-    for (const name of allNames) {
-      const meta = active[name];
-      if (meta && maxFlow > 0) {
-        const id = lineIdMap[name];
-        if (id) this._setLineColor(id, meta.color, true);
-
-        const rawRatio = maxFlow / meta.magnitude;
-        const factor = Math.min(Math.max(rawRatio, 1), 4);
-        const duration = baseDuration * factor;
-
-        this._startFlow(name, meta.geom, duration);
-      } else {
+    for (const name of derived.flows?.allNames || []) {
+      const meta = derived.flows?.active?.[name];
+      if (!meta) {
         this._stopFlow(name);
+        continue;
       }
+      if (meta.lineId) {
+        this._setLineColor(meta.lineId, meta.color, true);
+      }
+      this._startFlow(name, meta.motionSpec, meta.duration);
     }
   }
 
@@ -2964,44 +3628,10 @@ class CompactPowerCard extends (window.LitElement ||
       .trim();
   }
 
-  _buildFlowMotionPath(geom, reverseOverride = null) {
-    if (!geom) return null;
-    const reverse =
-      reverseOverride === null || reverseOverride === undefined
-        ? Boolean(geom.reverse)
-        : reverseOverride;
-
-    if (geom.mode === "path") {
-      const pathId = geom.pathId || null;
-      const pathEl = pathId ? this.shadowRoot?.getElementById(pathId) : null;
-      const pathData = pathEl?.getAttribute?.("d") || null;
-      if (pathData) {
-        return {
-          offsetPath: `path("${this._escapeMotionPathData(pathData)}")`,
-          reverse,
-        };
-      }
-      if (geom.fallback) {
-        return this._buildFlowMotionPath(geom.fallback, reverse);
-      }
-      return null;
-    }
-
-    if (geom.mode === "quad") {
-      const { x0, y0, cx, cy, x1, y1 } = geom;
-      if (!this._hasFiniteCoords([x0, y0, cx, cy, x1, y1])) return null;
-      return {
-        offsetPath: `path("M ${x0} ${y0} Q ${cx} ${cy} ${x1} ${y1}")`,
-        reverse,
-      };
-    }
-
-    const { x1, y1, x2, y2 } = geom;
-    if (!this._hasFiniteCoords([x1, y1, x2, y2])) return null;
-    return {
-      offsetPath: `path("M ${x1} ${y1} L ${x2} ${y2}")`,
-      reverse,
-    };
+  _motionSpecEquals(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    return a.offsetPath === b.offsetPath && Boolean(a.reverse) === Boolean(b.reverse);
   }
 
   _syncFlowIterationHandler(state) {
@@ -3010,6 +3640,7 @@ class CompactPowerCard extends (window.LitElement ||
     if (!dot || !handler) return;
     const shouldListen = Boolean(
       state.active &&
+      !state.reduced &&
       dot.classList.contains("active") &&
       this._hasPendingFlowUpdate(state)
     );
@@ -3022,19 +3653,41 @@ class CompactPowerCard extends (window.LitElement ||
     state.iterationListening = shouldListen;
   }
 
-  _setFlowAnimationStyles(dot, motionSpec, duration) {
+  _applyFlowPresentation(state, motionSpec, duration, reduced) {
+    const dot = state?.dot;
     if (!dot || !motionSpec) return;
     const start = motionSpec.reverse ? "100%" : "0%";
     const end = motionSpec.reverse ? "0%" : "100%";
+    const staticDistance = motionSpec.reverse ? "65%" : "35%";
     const durationMs = `${duration}ms`;
-    dot.style.removeProperty("opacity");
-    dot.style.setProperty("offset-path", motionSpec.offsetPath);
-    dot.style.setProperty("offset-distance", start);
-    if (dot.style.getPropertyValue("--cpc-flow-duration") !== durationMs) {
-      dot.style.setProperty("--cpc-flow-duration", durationMs);
+    const signature = reduced
+      ? `reduced|${motionSpec.offsetPath}|${motionSpec.reverse ? 1 : 0}|${staticDistance}`
+      : `normal|${motionSpec.offsetPath}|${motionSpec.reverse ? 1 : 0}|${durationMs}`;
+    if (state.appliedSignature !== signature) {
+      dot.style.setProperty("offset-path", motionSpec.offsetPath);
+      if (reduced) {
+        dot.style.setProperty("offset-distance", staticDistance);
+        dot.style.removeProperty("--cpc-flow-duration");
+        dot.style.removeProperty("--cpc-flow-start");
+        dot.style.removeProperty("--cpc-flow-end");
+        dot.style.setProperty("opacity", "1");
+      } else {
+        dot.style.removeProperty("opacity");
+        dot.style.setProperty("offset-distance", start);
+        if (dot.style.getPropertyValue("--cpc-flow-duration") !== durationMs) {
+          dot.style.setProperty("--cpc-flow-duration", durationMs);
+        }
+        dot.style.setProperty("--cpc-flow-start", start);
+        dot.style.setProperty("--cpc-flow-end", end);
+      }
+      state.appliedSignature = signature;
     }
-    dot.style.setProperty("--cpc-flow-start", start);
-    dot.style.setProperty("--cpc-flow-end", end);
+    if (reduced) {
+      dot.classList.remove("active");
+    } else {
+      dot.classList.add("active");
+    }
+    state.reduced = reduced;
   }
 
   _normalizeFlowDuration(duration) {
@@ -3042,96 +3695,86 @@ class CompactPowerCard extends (window.LitElement ||
     return Math.ceil(value / 100) * 100;
   }
 
-  _flowGeomEquals(a, b) {
-    if (a === b) return true;
-    if (!a || !b || a.mode !== b.mode || Boolean(a.reverse) !== Boolean(b.reverse)) return false;
-
-    if (a.mode === "path") {
-      return (
-        a.pathId === b.pathId &&
-        this._flowGeomEquals(a.fallback || null, b.fallback || null)
-      );
-    }
-
-    if (a.mode === "quad") {
-      return a.x0 === b.x0 && a.y0 === b.y0 && a.cx === b.cx && a.cy === b.cy && a.x1 === b.x1 && a.y1 === b.y1;
-    }
-
-    return a.x1 === b.x1 && a.y1 === b.y1 && a.x2 === b.x2 && a.y2 === b.y2;
-  }
-
   _hasPendingFlowDuration(state) {
     return Number.isFinite(state?.pendingDuration) && state.pendingDuration > 0;
   }
 
   _hasPendingFlowUpdate(state) {
-    return Boolean(state?.pendingGeom) || this._hasPendingFlowDuration(state);
+    return Boolean(state?.pendingMotionSpec) || this._hasPendingFlowDuration(state);
   }
 
   _commitFlowAnimation(name, state) {
     const dot = state?.dot || this.shadowRoot?.getElementById(`dot-${name}`);
     if (!dot) return;
-
-    const nextGeom = state?.pendingGeom || state?.geom;
+    const reduced = this._isReducedPerformanceActive();
+    const nextMotionSpec = state?.pendingMotionSpec || state?.motionSpec;
     const nextDuration =
       this._hasPendingFlowDuration(state)
         ? state.pendingDuration
         : state?.duration;
-    const hasPendingGeom = state?.pendingGeom !== null && state?.pendingGeom !== undefined;
-    const motionSpec =
-      hasPendingGeom || !state?.motionSpec
-        ? this._buildFlowMotionPath(nextGeom)
-        : state.motionSpec;
-    if (!motionSpec) {
+    if (!nextMotionSpec) {
       this._stopFlow(name);
       return;
     }
 
-    state.geom = nextGeom;
-    state.motionSpec = motionSpec;
+    state.dot = dot;
+    state.motionSpec = nextMotionSpec;
     state.duration = this._normalizeFlowDuration(nextDuration);
-    state.pendingGeom = null;
+    state.pendingMotionSpec = null;
     state.pendingDuration = null;
-
-    this._setFlowAnimationStyles(dot, motionSpec, state.duration);
+    this._applyFlowPresentation(state, state.motionSpec, state.duration, reduced);
     this._syncFlowIterationHandler(state);
   }
 
-  _startFlow(name, geom, duration) {
+  _startFlow(name, motionSpec, duration) {
+    if (!motionSpec) {
+      this._stopFlow(name);
+      return;
+    }
     if (!this._flowAnimations) this._flowAnimations = {};
+    const reduced = this._isReducedPerformanceActive();
 
     const existing = this._flowAnimations[name];
     if (existing && existing.active) {
       const nextDuration = this._normalizeFlowDuration(duration);
-      const geomChanged = !this._flowGeomEquals(geom, existing.geom);
+      const motionChanged = !this._motionSpecEquals(motionSpec, existing.motionSpec);
       const durationChanged = nextDuration !== existing.duration;
-
-      existing.pendingGeom = geomChanged ? geom : null;
+      if (reduced || existing.reduced !== reduced) {
+        existing.motionSpec = motionSpec;
+        existing.duration = nextDuration;
+        existing.pendingMotionSpec = null;
+        existing.pendingDuration = null;
+        this._commitFlowAnimation(name, existing);
+        return;
+      }
+      existing.pendingMotionSpec = motionChanged ? motionSpec : null;
       existing.pendingDuration = durationChanged ? nextDuration : null;
+      if (!this._hasPendingFlowUpdate(existing) && existing.appliedSignature == null) {
+        this._commitFlowAnimation(name, existing);
+        return;
+      }
       this._syncFlowIterationHandler(existing);
       return;
     }
 
     const dot = this.shadowRoot.getElementById(`dot-${name}`);
     if (!dot) return;
-    dot.style.removeProperty("opacity");
 
     const animState = {
       active: true,
       dot,
-      geom,
-      motionSpec: null,
+      motionSpec,
       duration: this._normalizeFlowDuration(duration),
-      pendingGeom: null,
+      pendingMotionSpec: null,
       pendingDuration: null,
       iterationHandler: null,
       iterationListening: false,
+      reduced,
+      appliedSignature: null,
     };
 
     const iterationHandler = () => {
       if (!animState.active) return;
-      // Geometry and duration updates can be queued independently; duration-only
-      // changes still wait for the next completed cycle to avoid mid-cycle jumps.
       if (!this._hasPendingFlowUpdate(animState)) return;
       this._commitFlowAnimation(name, animState);
     };
@@ -3139,7 +3782,6 @@ class CompactPowerCard extends (window.LitElement ||
 
     this._flowAnimations[name] = animState;
     this._commitFlowAnimation(name, animState);
-    dot.classList.add("active");
   }
 
   _stopFlow(name) {
@@ -3160,6 +3802,9 @@ class CompactPowerCard extends (window.LitElement ||
       dot.style.removeProperty("--cpc-flow-end");
       dot.style.setProperty("opacity", "0");
     }
+    state.pendingMotionSpec = null;
+    state.pendingDuration = null;
+    state.appliedSignature = null;
 
     delete this._flowAnimations[name];
   }
@@ -3207,46 +3852,76 @@ class CompactPowerCard extends (window.LitElement ||
 
   render() {
     const html = this.html;
+    const snapshot = this._getDerivedSnapshot();
+    if (!snapshot) {
+      return html``;
+    }
+    this._renderState = { snapshot };
 
-    const pvCfg = this._getEntityConfig("pv");
-    const hasPv =
-      this._config?.entities &&
-      Object.prototype.hasOwnProperty.call(this._config.entities, "pv");
-    const gridCfg = this._getEntityConfig("grid");
-    const homeCfg = this._getEntityConfig("home");
-    const batteryRaw = this._getEntityConfig("battery");
-    const batteryList = Array.isArray(batteryRaw)
-      ? batteryRaw
-      : batteryRaw
-      ? [batteryRaw]
-      : [{ entity: null }];
-    const batteryCfg = batteryList[0] || { entity: null };
-    const hasBattery =
-      this._config?.entities &&
-      Object.prototype.hasOwnProperty.call(this._config.entities, "battery") &&
-      batteryList.some((b) =>
-        Boolean(
-          b?.entity ||
-            b?.charge_entity ||
-            b?.discharge_entity ||
-            b?.chargeEntity ||
-            b?.dischargeEntity
-        )
-      );
-    const pvInBatterySlot = !hasBattery && Boolean(pvCfg?.entity);
-    const invertGrid = Boolean(gridCfg?.invert_state_values);
-    const invertBattery = Boolean(batteryCfg?.invert_state_values);
-    const gridUsesDirectional =
-      Boolean(gridCfg?.import_entity || gridCfg?.export_entity || gridCfg?.importEntity || gridCfg?.exportEntity);
-    const invertGridEffective = invertGrid && !gridUsesDirectional;
-    const pvLabels = this._normalizeLabels(pvCfg?.labels, null);
-    const batteryLabelsSource = Array.isArray(this._config?.entities?.battery)
-      ? this._config?.entities?.battery_labels || this._config?.entities?.battery?.labels
-      : batteryCfg?.labels;
-    const batteryLabels = this._normalizeLabels(batteryLabelsSource, null);
-    const { sources: normalizedSources } = this._getSourcesConfig();
-    const enableDevicePowerLines = this._useDevicePowerLines();
-    const allowGlow = this._allowGlowEffects();
+    const {
+      reducedPerformanceActive,
+      allowGlow,
+      enableDevicePowerLines,
+      pvCfg,
+      gridCfg,
+      homeCfg,
+      batteryCfg,
+      batteryList,
+      batteryLabelsSource,
+      normalizedSources,
+      hasPv,
+      hasBattery,
+      pvInBatterySlot,
+      pvLabels,
+      gridLabelsRaw,
+      batteryLabels,
+      layout,
+      geometry,
+      units: {
+        pvUnitRaw,
+        gridUnitRaw,
+        batteryUnitRaw,
+      },
+      colors: {
+        pvColor,
+        gridColor,
+        homeColor,
+        batteryColor,
+      },
+      power: {
+        pvMeta,
+        gridMeta,
+        homeMeta,
+        homeNumericW,
+        homeEffectiveW,
+        gridNumericW,
+        battNumericW,
+        batteryComputed,
+        pvRawW,
+      },
+      thresholds: {
+        pvThreshold: pvThresholdDisplay,
+        gridThreshold: gridThresholdDisplay,
+        batteryThresholdDisplay,
+        homeThresholdDisplay,
+      },
+      display: {
+        pvOpacity,
+        gridOpacity,
+        homeOpacity,
+        batteryOpacity,
+        pvLabelHidden,
+        gridLabelHidden,
+        homeLabelHidden,
+        batteryLabelHidden,
+        homeValueForOpacity,
+        gridArrow,
+        battArrow,
+      },
+      batterySoc,
+      device,
+    } = snapshot;
+    const batteryLabelsRaw = batteryLabels;
     const homeGlowOpacity = allowGlow ? 0.3 : 0;
     const homeTapAction = String(homeCfg?.tap_action || "more_info").toLowerCase();
     const homeNavigatePath = homeCfg?.navigation_path || homeCfg?.navigationPath || null;
@@ -3263,65 +3938,26 @@ class CompactPowerCard extends (window.LitElement ||
     const hasGridIconOverride = Boolean(gridCfg?.icon);
     const gridIconPath =
       this._getMdiPath(gridIconId) || this._getMdiPath("mdi:transmission-tower");
-    const gridLabelsRaw = this._normalizeLabels(gridCfg?.labels, null);
-    const batteryLabelsRaw = this._normalizeLabels(batteryLabelsSource, null);
-    const hasAnyLabels =
-      pvLabels.length > 0 || gridLabelsRaw.length > 0 || batteryLabelsRaw.length > 0;
-    const layout = this._getLayoutMetrics({
-      hasPv,
-      hasBattery,
-      hasAnyLabels,
-    });
     const {
       designWidth,
-      designHeight,
       baseWidth,
-      baseHeight,
       viewHeight,
-      renderScaleY,
-      xScale,
-      yScale,
       rowCount,
       columnCount,
       maxItemsByColumns,
-      anchorLeftX,
       sx,
-      yOffset,
-      syTop,
       sy,
       syHome,
       syGridBatt,
       homeCenterX,
       pvCenterX,
-      pvNodeY,
-      homeAnchorY,
-      homeLineEndY,
       gridLineStartX,
       gridLineEndX,
       gridNodeY,
-      gridPvStartY,
-      humpWidth,
-      humpHeight,
-      humpHeightAdj,
-      humpStartX,
-      humpEndX,
-      humpPeakY,
-      humpCtrlInX,
-      humpCtrlOutX,
-      pvGridEndX,
       pvGridTurnRadius,
-      pvBatteryStartX,
-      pvBatteryEndY,
-      gridHomeStartY,
-      gridHomeEndX,
-      batteryHomeStartY,
-      batteryHomeEndX,
       pvNode,
-      gridNode,
-      batteryNode,
       homeNode,
     } = layout;
-    const deviceYOffset = this._shouldUseExternalHeight() && rowCount < 3 ? 20 : 0;
     const labelBonus = !hasPv || !hasBattery ? (rowCount >= 4 ? 2 : 1) : 0;
     const gridBatteryBonus =
       hasPv && hasBattery && pvLabels.length <= 4
@@ -3358,7 +3994,7 @@ class CompactPowerCard extends (window.LitElement ||
               (rowCount >= 7 ? 1 : 0) +
               (rowCount >= 8 ? 1 : 0)
           );
-    const showDeviceNames = rowCount >= 4;
+    const showDeviceNames = device.showDeviceNames;
     const showPvLabelNames = rowCount >= 4;
     const widthScale = 1;
     const iconOffset = 26 * widthScale;
@@ -3378,73 +4014,17 @@ class CompactPowerCard extends (window.LitElement ||
     const gridUnitOverride = this._getUnitOverride(gridCfg);
     const batteryUnitOverride = this._getUnitOverride(batteryCfg);
     const homeUnitOverride = this._getUnitOverride(homeCfg);
-
-    const pvUnitRaw =
-      this.hass?.states?.[pvCfg.entity]?.attributes?.unit_of_measurement || "";
-    const gridMeta = this._getGridPowerMeta(gridCfg, gridUnitOverride ?? null);
-    const gridUnitRaw =
-      gridMeta?.unit ||
-      this.hass?.states?.[gridCfg.entity]?.attributes?.unit_of_measurement ||
-      "";
-    const batteryUnitRaw =
-      batteryList
-        .map((cfg) => this._getBatteryPowerMeta(cfg)?.unit ||
-          (cfg.entity && this.hass?.states?.[cfg.entity]?.attributes?.unit_of_measurement) || "")
-        .find((u) => u) || "";
-
-    // Numeric values in watts
-    const pvNumeric = this._getNumeric(pvCfg.entity);
-    const homeNumeric = this._getNumeric(homeCfg.entity);
-    const pvNumericW = this._toWatts(pvNumeric, pvUnitRaw);
-    const gridNumericRaw = gridMeta?.value ?? this._getNumeric(gridCfg.entity);
-    const gridNumeric = invertGridEffective ? -gridNumericRaw : gridNumericRaw;
-    const gridNumericW = Number.isFinite(gridMeta?.watts)
-      ? (invertGridEffective ? -gridMeta.watts : gridMeta.watts)
-      : this._toWatts(gridNumeric, gridUnitRaw);
-
-    const thresholdMode = String(this._config?.threshold_mode || "calculations").toLowerCase();
-    const useThresholdForCalc = thresholdMode === "calculations";
-    const applyThreshold = (value, threshold) => {
-      if (threshold == null) return value;
-      return Math.abs(value) < threshold ? 0 : value;
-    };
-
+    const pvNumeric = pvMeta?.value ?? 0;
+    const pvNumericW = pvRawW;
     const pvDisplayUnit = "W";
     const pvState = this.hass?.states?.[pvCfg.entity]?.state;
     const pvVal = Number.isFinite(pvNumericW)
       ? this._formatPowerWithOverride(pvNumericW, pvDecimals, pvDisplayUnit, pvUnitOverride ?? null)
       : this._formatEntity(pvCfg.entity, pvDecimals, null, pvUnitOverride);
     const gridDisplayUnit = "W";
+    const gridNumeric = gridNumericW;
     const battUnit = "W";
-    const battSocEntity = null;
-    const battSocLabel = null;
-    const batteryShowSoc = Boolean(batteryCfg?.show_soc);
-    const batteryItems = batteryList.map((cfg) => {
-      const meta = this._getBatteryPowerMeta(cfg);
-      const unit =
-        meta?.unit ||
-        (cfg.entity && this.hass?.states?.[cfg.entity]?.attributes?.unit_of_measurement) ||
-        "";
-      const raw = meta?.value != null ? meta.value : this._getNumeric(cfg.entity);
-      const hasDirectional =
-        Boolean(cfg?.charge_entity || cfg?.discharge_entity || cfg?.chargeEntity || cfg?.dischargeEntity);
-      const inverted = (!hasDirectional && (cfg?.invert_state_values || invertBattery)) ? -raw : raw;
-      const rawW = Number.isFinite(meta?.watts)
-        ? (!hasDirectional && (cfg?.invert_state_values || invertBattery) ? -meta.watts : meta.watts)
-        : this._toWatts(inverted, unit);
-      const thr = this._toWatts(this._parseThreshold(cfg.threshold), "W", true);
-      const effective = useThresholdForCalc ? applyThreshold(rawW, thr) : rawW;
-      return { cfg, raw: rawW, effective, threshold: thr, unit };
-    });
-    const batteryComputed = batteryItems;
-    const battNumericW = batteryItems.reduce((sum, item) => sum + item.effective, 0);
-    const pvThresholdDisplay = this._toWatts(this._parseThreshold(pvCfg.threshold), "W", true);
-    const gridThresholdDisplay = this._toWatts(this._parseThreshold(gridCfg.threshold), "W", true);
-    const batteryThresholdDisplay = this._toWatts(
-      this._parseThreshold(batteryCfg.threshold),
-      "W",
-      true
-    );
+    const batteryItems = batteryComputed;
     const renderValue = (text) => {
       if (!text) return text;
       const m = /^([+-]?\d[\d.,]*)(\s+.+)?$/.exec(String(text));
@@ -3464,26 +4044,10 @@ class CompactPowerCard extends (window.LitElement ||
         : ""}`;
     };
     const gridState = this.hass?.states?.[gridCfg.entity]?.state;
-    let gridVal = Number.isFinite(gridNumericW)
+    const gridVal = Number.isFinite(gridNumericW)
       ? this._formatPowerWithOverride(Math.abs(gridNumericW), gridDecimals, gridDisplayUnit, gridUnitOverride ?? null)
       : gridState;
-    let gridArrow = null;
-    if (Number.isFinite(gridNumericW)) {
-      gridArrow =
-        gridNumericW > 0
-          ? "mdi:arrow-left"
-          : gridNumericW < 0
-          ? "mdi:arrow-right"
-          : null;
-    }
-
-    const inferredHomeUnit =
-      pvUnitRaw || gridUnitRaw || batteryUnitRaw || homeUnitOverride || "W";
     const homeUnit = "W";
-    const homeNumericW = this._toWatts(homeNumeric, inferredHomeUnit);
-    const homeEffectiveW = this._homeEffective || 0;
-    const homeEffectiveRender = homeEffectiveW;
-    const homeThresholdDisplay = this._toWatts(this._parseThreshold(homeCfg.threshold), "W", true);
     const forceRawHome =
       homeCfg.force_raw_state ||
       homeCfg.force_raw ||
@@ -3492,32 +4056,21 @@ class CompactPowerCard extends (window.LitElement ||
     let homeVal = Number.isFinite(homeNumericW)
       ? this._formatPowerWithOverride(homeNumericW, homeDecimals, homeUnit, homeUnitOverride ?? null)
       : this._formatEntity(homeCfg.entity, homeDecimals, null, homeUnitOverride);
-    if (!forceRawHome && this._homeEffective != null) {
+    if (!forceRawHome && homeEffectiveW != null) {
       const effectiveDisplay = homeEffectiveW;
       homeVal = this._formatPowerWithOverride(effectiveDisplay, homeDecimals, homeUnit, homeUnitOverride ?? null);
     }
-
-    const pvColor = this._getColor("pv", pvCfg);
-    const gridColor = this._getColor("grid", gridCfg);
-    const homeColor = this._getColor("home", homeCfg);
-    const batteryColor = this._getColor("battery", batteryCfg);
-
-    const pvOpacity = this._opacityFor(pvNumericW, pvThresholdDisplay);
-    const gridOpacity = this._opacityFor(gridNumericW, gridThresholdDisplay);
-    const homeValueForOpacity = homeCfg?.entity ? homeNumericW : homeEffectiveW;
-    const homeOpacity = this._opacityFor(homeValueForOpacity, homeThresholdDisplay);
-    const batteryOpacity = this._opacityFor(battNumericW, batteryThresholdDisplay);
     const batteryLabelOpacity = batteryOpacity;
-    const pvLabelHidden = this._isBelowThreshold(pvNumericW, pvThresholdDisplay);
-    const gridLabelHidden = this._isBelowThreshold(gridNumericW, gridThresholdDisplay);
-    const homeLabelHidden = this._isBelowThreshold(homeValueForOpacity, homeThresholdDisplay);
-    const batteryLabelHidden = this._isBelowThreshold(battNumericW, batteryThresholdDisplay);
 
     const labelFlickerMs = 500;
     const labelFlickerNow = Date.now();
     if (!this._labelFlickerStates) this._labelFlickerStates = new Map();
     const nextLabelStates = new Map();
     const recordLabelFlicker = (key, active) => {
+      if (reducedPerformanceActive) {
+        nextLabelStates.set(key, { active, flickerUntil: 0 });
+        return false;
+      }
       const prevState = this._labelFlickerStates.get(key) || {};
       let flickerUntil = prevState.flickerUntil || 0;
       if (prevState.active && !active) {
@@ -3540,41 +4093,9 @@ class CompactPowerCard extends (window.LitElement ||
     const batteryLabelFlicker = recordLabelFlicker("battery", batteryLabelActive);
 
     const battDisplay = battNumericW;
-    const batterySocEntries = batteryList.map((cfg) => {
-      const soc = this._getBatterySocValue(cfg);
-      const rawCap = cfg?.battery_capacity;
-      const cap =
-        rawCap == null
-          ? null
-          : Number.isFinite(rawCap)
-          ? rawCap
-          : Number.isFinite(parseFloat(rawCap))
-          ? parseFloat(rawCap)
-          : null;
-      const capKwh = cap != null && cap > 0 ? cap : null;
-      return { soc, cap: capKwh };
-    });
-    const socValues = batterySocEntries.map((e) => e.soc).filter((v) => Number.isFinite(v));
-    const allHaveCap =
-      batterySocEntries.length > 0 &&
-      batterySocEntries.every((e) => Number.isFinite(e.soc) && Number.isFinite(e.cap));
-    const batterySocPrimary = allHaveCap
-      ? (() => {
-          const totalCap = batterySocEntries.reduce((sum, e) => sum + (e.cap || 0), 0);
-          if (totalCap <= 0) return null;
-          const energy = batterySocEntries.reduce(
-            (sum, e) => sum + (e.cap || 0) * (e.soc || 0) / 100,
-            0
-          );
-          return (energy / totalCap) * 100;
-        })()
-      : socValues.length > 0
-      ? socValues.reduce((sum, v) => sum + v, 0) / socValues.length
-      : null;
-    const batterySocDisplay = batteryShowSoc && Number.isFinite(batterySocPrimary)
-      ? Math.round(batterySocPrimary)
-      : null;
-    const batterySocEntity = batteryShowSoc ? this._getBatterySocEntity(batteryCfg) : null;
+    const batterySocPrimary = batterySoc.primary;
+    const batterySocDisplay = batterySoc.display;
+    const batterySocEntity = batterySoc.entity;
     const batterySocClickable = Boolean(batterySocEntity) && batteryList.length <= 1;
     this._labelFlickerStates = nextLabelStates;
     let nextLabelFlickerEnd = null;
@@ -3587,13 +4108,16 @@ class CompactPowerCard extends (window.LitElement ||
             : Math.min(nextLabelFlickerEnd, flickerUntil);
       }
     }
-    if (nextLabelFlickerEnd != null) {
+    if (nextLabelFlickerEnd != null && !reducedPerformanceActive) {
       const delay = Math.max(0, nextLabelFlickerEnd - labelFlickerNow + 20);
       if (this._labelFlickerTimer) clearTimeout(this._labelFlickerTimer);
       this._labelFlickerTimer = setTimeout(() => {
         this._labelFlickerTimer = null;
         this.requestUpdate();
       }, delay);
+    } else if (this._labelFlickerTimer) {
+      clearTimeout(this._labelFlickerTimer);
+      this._labelFlickerTimer = null;
     }
 
     const battVal = Number.isFinite(battDisplay)
@@ -3615,8 +4139,6 @@ class CompactPowerCard extends (window.LitElement ||
     const battValNode = typeof battValDisplay === "string"
       ? renderValue(battValDisplay)
       : battValDisplay;
-    const battArrow =
-      battDisplay > 0 ? "mdi:arrow-left" : battDisplay < 0 ? "mdi:arrow-right" : null;
     const batteryIcon = Number.isFinite(batterySocPrimary)
       ? this._getBatteryIcon(batterySocPrimary)
       : battDisplay < 0
@@ -3627,189 +4149,61 @@ class CompactPowerCard extends (window.LitElement ||
     const batteryIconPath = this._getMdiPath(batteryIconId);
 
     const batteryIconOpacity = 1;
-    const curveFactor = this._getCurveFactor();
-    const curvedLines = curveFactor > 0;
-    const curveScale = curvedLines ? (curveFactor - 1) / 4 : 0; // 0 at factor 1, 1 at factor 5
-    const cornerBaseRadius = pvGridTurnRadius;
-    const sourcePositions = [];
-    const homeX = homeCenterX;
-    const homeRowYBase = 145 + deviceYOffset; // base Y for aux row; actual Y will be adjusted via pctHomeY
 
     const deviceFlickerMs = 500;
     const deviceFlickerNow = Date.now();
     if (!this._deviceLineStates) this._deviceLineStates = new Map();
     const nextDeviceStates = new Map();
-    const deviceSources = normalizedSources.map((src, idx) => {
-      const entity = src.entity || null;
-      const switchEntity = src.switch_entity || src.switchEntity || null;
-      const attribute = src.attribute || null;
-      const name = src.name || null;
-      const nameEntity = name && this.hass?.states?.[name] ? name : null;
-      const displayName = nameEntity ? this._formatEntityStateWithUnit(nameEntity) : name;
-      const icon = src.icon || this._getEntityIcon(entity, "mdi:power-plug");
-      const isPowerDevice = this._isPowerDevice(entity);
-      const st = entity ? this.hass?.states?.[entity] : null;
-      const raw = attribute ? st?.attributes?.[attribute] : st?.state;
-      const isUnavailable = this._isUnavailableState(raw);
-      const numeric = isUnavailable ? 0 : this._getNumericMaybe(entity, attribute);
-      const unit = st?.attributes?.unit_of_measurement || "";
-      const decimals = this._getDecimalPlaces(src);
-      const numericW = isUnavailable ? 0 : this._toWatts(numeric, unit, true);
-      const hasNumeric = isUnavailable ? true : Number.isFinite(numericW);
-      const unitOverride = this._getUnitOverride(src);
-      let val = hasNumeric
-        ? this._formatPowerWithOverride(numericW, decimals, "W", unitOverride ?? null)
-        : this._formatEntity(entity, decimals, attribute, unitOverride);
-      const color = src.color || homeColor;
-      const threshold = this._toWatts(this._parseThreshold(src.threshold), "W", true);
-      const opacity = hasNumeric ? this._opacityFor(numericW, threshold) : 1;
-      const hidden =
-        (hasNumeric && this._isBelowThreshold(numericW, threshold)) ||
-        (this._coerceBoolean(src.force_hide_under_threshold, false) && numericW === 0);
-      const forceHideUnderThreshold = this._coerceBoolean(src.force_hide_under_threshold, false);
-      let switchOn = false;
-      if (isPowerDevice && switchEntity) {
-        const swState = this.hass?.states?.[switchEntity]?.state;
-        switchOn = String(swState || "").toLowerCase() === "on";
+    const sources = device.sources.map((src) => {
+      if (!src.isPowerDevice) return { ...src, flicker: false };
+      const prevState = this._deviceLineStates.get(src.key) || {};
+      let flickerUntil = reducedPerformanceActive ? 0 : prevState.flickerUntil || 0;
+      if (!reducedPerformanceActive && prevState.active && !src.active) {
+        flickerUntil = deviceFlickerNow + deviceFlickerMs;
       }
-      return {
-        sourceIndex: idx,
-        entity,
-        switchEntity,
-        switchOn,
-        name: displayName,
-        icon,
-        val,
-        color,
-        opacity,
-        hidden,
-        numeric: hasNumeric ? numericW : 0,
-        isPowerDevice,
-        threshold,
-        forceHideUnderThreshold,
-      };
-    });
-
-    const visibleSources = deviceSources.filter(
-      (src) => !(src.forceHideUnderThreshold && src.hidden)
-    );
-    const maxDevices = Math.min(visibleSources.length, maxItemsByColumns);
-    const deviceVisible = visibleSources.slice(0, maxDevices);
-
-    if (maxDevices > 0) {
-      // Build outward from the home icon in viewBox coords; spacing is driven by column count.
-      const deviceWidth = baseWidth;
-      const pad = Math.max(16, deviceWidth * 0.05);
-      const columnWidth = columnCount > 0 ? deviceWidth / columnCount : deviceWidth / 12;
-      const spacingBase = Math.max(
-        columnWidth * 1.5, // 1.5 columns per device slot
-        56 * (deviceWidth / designWidth) // keep a sensible minimum spacing on small widths
-      );
-      const deviceRings = Math.max(1, Math.ceil(maxDevices / 2));
-      const maxSpacing = (deviceWidth / 2 - pad) / deviceRings;
-      const spacing = Math.max(0, Math.min(spacingBase, maxSpacing));
-
-      for (let ring = 1; sourcePositions.length < maxDevices; ring++) {
-        const leftX = homeX - spacing * ring;
-        const rightX = homeX + spacing * ring;
-        const clampedLeft = Math.max(pad, Math.min(deviceWidth - pad, leftX));
-        const clampedRight = Math.max(pad, Math.min(deviceWidth - pad, rightX));
-        sourcePositions.push({
-          x: clampedLeft,
-          y: homeRowYBase,
-          leftPct: (clampedLeft / deviceWidth) * 100,
-        });
-        if (sourcePositions.length < maxDevices) {
-          sourcePositions.push({
-            x: clampedRight,
-            y: homeRowYBase,
-            leftPct: (clampedRight / deviceWidth) * 100,
-          });
-        }
-        if (ring >= deviceRings) break;
+      if (src.active || reducedPerformanceActive) flickerUntil = 0;
+      if (flickerUntil && flickerUntil <= deviceFlickerNow) {
+        flickerUntil = 0;
       }
-    }
-
-    const sources = deviceVisible.map((src, idx) => {
-      const pos = sourcePositions[idx] || { x: homeX, y: homeRowYBase };
-      const key = src.entity || `idx-${src.sourceIndex}`;
-      let active = false;
-      let flicker = false;
-      let flickerUntil = 0;
-      if (src.isPowerDevice) {
-        if (src.switchEntity) {
-          active = src.switchOn;
-        } else {
-          active = src.numeric > 0 && !src.hidden;
-        }
-        const prevState = this._deviceLineStates.get(key) || {};
-        flickerUntil = prevState.flickerUntil || 0;
-        if (prevState.active && !active) {
-          flickerUntil = deviceFlickerNow + deviceFlickerMs;
-        }
-        if (active) flickerUntil = 0;
-        if (flickerUntil && flickerUntil <= deviceFlickerNow) {
-          flickerUntil = 0;
-        }
-        flicker = flickerUntil > deviceFlickerNow;
-        nextDeviceStates.set(key, { active, flickerUntil });
-      }
-      const leftPct = pos.leftPct != null ? pos.leftPct : (pos.x / baseWidth) * 100;
-      const topPctVal = pctHomeY(pos.y);
+      const flicker = !reducedPerformanceActive && flickerUntil > deviceFlickerNow;
+      nextDeviceStates.set(src.key, { active: src.active, flickerUntil });
       return {
         ...src,
-        key,
-        pos,
-        leftPct,
-        topPct: topPctVal,
-        active,
         flicker,
       };
     });
-    const hasDeviceSources = sources.length > 0;
-    const deviceUsageWatts = sources.reduce((total, src) => {
-      if (!src?.isPowerDevice) return total;
-      const val = src?.hidden ? 0 : Math.max(src?.numeric ?? 0, 0);
-      return total + val;
-    }, 0);
-    const deviceUsageActive = deviceUsageWatts > 0;
-    const pulseMinSeconds = 0.6;
-    const pulseMaxSeconds = 2.2;
-    const pulseMaxWatts = 5000;
-    const pulseT = Math.min(deviceUsageWatts, pulseMaxWatts) / pulseMaxWatts;
-    const devicePulseSeconds = pulseMaxSeconds - (pulseMaxSeconds - pulseMinSeconds) * pulseT;
-    const deviceJunctionTopPct = pctHomeY(homeRowYBase + 26);
-    let deviceLines = [];
-    if (enableDevicePowerLines) {
-      deviceLines = sourcePositions.map((pos, idx) => {
-        const src = sources[idx];
-        if (!src?.isPowerDevice) return null;
-        if (!src) return null;
-        const active = Boolean(src.active);
-        const startX = pos.x;
-        const startY = syHome(homeRowYBase + 22); // start just below label, anchored to bottom
-        const downY = startY + 8;
-        const upY = startY + 4;
-        const color = homeColor;
-        const dashed = !active;
-        const opacity = dashed ? 0.1 : 1;
-        return {
-          key: src.key || src.entity || `idx-${idx}`,
-          active,
-          color,
-          opacity,
-          idx,
-          startX,
-          startY,
-          downY,
-          upY,
-          homeX: homeNode.x,
-          dashed,
-        };
-      }).filter(Boolean);
-    }
+    const hasDeviceSources = device.hasDeviceSources;
+    const deviceUsageActive = device.deviceUsageActive;
+    const devicePulseSeconds = device.devicePulseSeconds;
+    const deviceJunctionTopPct = device.deviceJunctionTopPct;
+    const deviceLines = enableDevicePowerLines
+      ? device.lineBases.map((line) => {
+          const state = nextDeviceStates.get(line.key) || { active: line.active, flickerUntil: 0 };
+          return {
+            ...line,
+            flicker:
+              !reducedPerformanceActive &&
+              Boolean((state?.flickerUntil || 0) > deviceFlickerNow),
+          };
+        })
+      : [];
     this._deviceLines = deviceLines;
     this._deviceLineStates = nextDeviceStates;
+    this._deviceLineRenderSignature = deviceLines
+      .map((line) => [
+        line.key,
+        line.active ? 1 : 0,
+        line.startX,
+        line.startY,
+        line.downY,
+        line.upY,
+        line.homeX,
+        line.color,
+        line.opacity,
+        line.dashed ? 1 : 0,
+        line.flicker ? 1 : 0,
+      ].join(":"))
+      .join("|");
 
     const pvLabelPositions = [];
     const pvLabelPad = Math.max(16, baseWidth * 0.05);
@@ -4093,47 +4487,13 @@ class CompactPowerCard extends (window.LitElement ||
     const batteryListAnchor = gridNodeY - 18; // align list a bit above node
     const batteryDetailsOffsetPx = 44; // vertical gap from the icon/label to the multi list
     const batteryDetailsTopPx = batteryListAnchor + batteryDetailsOffsetPx;
-
-
-    const makeCornerPath = (startX, startY, endX, endY, sweepFlag, firstAxis = "H") => {
-      if (!curvedLines) return firstAxis === "H"
-        ? `M${startX} ${startY} H${endX} V${endY}`
-        : `M${startX} ${startY} V${endY} H${endX}`;
-
-      const spanX = Math.abs(endX - startX);
-      const spanY = Math.abs(endY - startY);
-      const cornerX = firstAxis === "H" ? endX : startX;
-      const cornerY = firstAxis === "H" ? startY : endY;
-
-      if (curveFactor >= 5) {
-        // Single smooth curve from start to end via the corner.
-        return `M${startX} ${startY} Q${cornerX} ${cornerY} ${endX} ${endY}`;
-      }
-
-      const maxInset = Math.min(spanX, spanY); // so inset never exceeds the shorter leg
-      const inset = cornerBaseRadius + (maxInset - cornerBaseRadius) * curveScale;
-      const r = inset;
-
-      if (firstAxis === "H") {
-        const horizEnd = endX > startX ? endX - inset : endX + inset;
-        const arcEndY = endY > startY ? startY + inset : startY - inset;
-        const sweep = sweepFlag; // 0 or 1
-        return `M${startX} ${startY} H${horizEnd} A${r} ${r} 0 0 ${sweep} ${endX} ${arcEndY} V${endY}`;
-      } else {
-        const vertEnd = endY > startY ? endY - inset : endY + inset;
-        const arcEndX = endX > startX ? startX + inset : startX - inset;
-        const sweep = sweepFlag;
-        return `M${startX} ${startY} V${vertEnd} A${r} ${r} 0 0 ${sweep} ${arcEndX} ${endY} H${endX}`;
-      }
-    };
-
-    const pvGridPath = makeCornerPath(gridLineStartX, gridPvStartY, pvGridEndX, pvNode.y, 0, "H");
-    const pvBatteryPath = makeCornerPath(pvBatteryStartX, pvNode.y, batteryNode.x, pvBatteryEndY, 0, "V");
-    const gridHomePath = makeCornerPath(gridNode.x, gridHomeStartY, gridHomeEndX, homeNode.y, 1, "H");
-    const batteryHomePath = makeCornerPath(batteryNode.x, batteryHomeStartY, batteryHomeEndX, homeNode.y, 0, "H");
-    const gridBatteryPath = curvedLines
-      ? `M${gridNode.x} ${gridNode.y} H${humpStartX} Q${humpCtrlInX} ${humpPeakY} ${homeCenterX} ${humpPeakY} Q${humpCtrlOutX} ${humpPeakY} ${humpEndX} ${gridNode.y} H${batteryNode.x}`
-      : `M${gridNode.x} ${gridNode.y} H${batteryNode.x}`;
+    const {
+      pvGridPath,
+      pvBatteryPath,
+      gridHomePath,
+      batteryHomePath,
+      gridBatteryPath,
+    } = geometry.paths;
 
     const layoutReady = this._layoutReady;
     const hideCardBackground = this._coerceBoolean(this._config?.hide_card_background, false);
@@ -4311,7 +4671,7 @@ class CompactPowerCard extends (window.LitElement ||
             </div>
             ${enableDevicePowerLines && hasDeviceSources && deviceUsageActive
               ? html`<div class="overlay-item device-power-dot-wrapper" style="left:${(homeCenterX/baseWidth)*100}%; top: calc(${deviceJunctionTopPct}% + 4px);">
-                  <div class="device-power-dot ${deviceUsageActive ? "active" : ""}" style="color:${homeColor};${deviceUsageActive ? `animation-duration:${devicePulseSeconds.toFixed(2)}s;` : ""}"></div>
+                  <div class="device-power-dot ${deviceUsageActive && !reducedPerformanceActive ? "active" : ""}" style="color:${homeColor};${deviceUsageActive && !reducedPerformanceActive ? `animation-duration:${devicePulseSeconds.toFixed(2)}s;` : ""}"></div>
                 </div>`
               : ""}
             ${hasBattery
