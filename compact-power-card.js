@@ -1,3 +1,10 @@
+const CPC_LOAF_REDUCED_PERFORMANCE = Object.freeze({
+  minDurationMs: 200,
+  sampleWindowMs: 8000,
+  activationCount: 4,
+  activeDurationMs: 5000,
+});
+
 class CompactPowerCard extends (window.LitElement ||
   Object.getPrototypeOf(customElements.get("ha-panel-lovelace"))) {
 
@@ -510,8 +517,6 @@ class CompactPowerCard extends (window.LitElement ||
     this._derivedSnapshotDirty = true;
     this._renderState = null;
     this._layoutMetricsCache = null;
-    this._homeEffective = null;
-    this._homeEffectiveUnit = "W";
     this._resizeObserver = null;
     this._hostWidth = null;
     this._hostHeight = null;
@@ -522,11 +527,10 @@ class CompactPowerCard extends (window.LitElement ||
     this._deviceLineFlickerTimer = null;
     this._labelFlickerStates = new Map();
     this._labelFlickerTimer = null;
-    this._trackedEntityIds = new Set();
-    this._trackedEntityAttributes = new Map();
-    this._lastEntityStates = new Map();
+    this._trackedEntityIds = [];
+    this._lastEntityStates = [];
+    this._hasTrackedStateSnapshot = false;
     this._lastThemeMode = null;
-    this._lastVisibleStateSignature = null;
     this._iconPathCache = new Map();
     this._iconPathPending = new Set();
     this._pendingFlowUpdate = false;
@@ -538,7 +542,6 @@ class CompactPowerCard extends (window.LitElement ||
     this._lastRenderedDeviceLineGeometryKey = null;
     this._lastLayoutSyncKey = null;
     this._lastScaleValue = null;
-    this._lastHomeGradientSignature = null;
     this._updateTimeout = null;
     this._homeGradientFrame = null;
     this._loafObserver = null;
@@ -591,11 +594,10 @@ class CompactPowerCard extends (window.LitElement ||
       ? Math.min(2.0, Math.max(0.5, fontScaleRaw))
       : 1;
     this.style.setProperty("--cpc-text-scale", String(fontScale));
-    this._trackedEntityAttributes = this._collectTrackedEntityAttributes();
-    this._trackedEntityIds = new Set(this._trackedEntityAttributes.keys());
-    this._lastEntityStates.clear();
+    this._trackedEntityIds = this._collectTrackedEntityIds();
+    this._lastEntityStates = new Array(this._trackedEntityIds.length);
+    this._hasTrackedStateSnapshot = false;
     this._lastThemeMode = null;
-    this._lastVisibleStateSignature = null;
     this._invalidateDerivedSnapshot();
   }
 
@@ -1698,32 +1700,14 @@ class CompactPowerCard extends (window.LitElement ||
     this._renderState = null;
   }
 
-  _stringifySignatureValue(value) {
-    if (value === undefined) return "undefined";
-    if (value === null) return "null";
-    if (typeof value === "object") {
-      try {
-        return JSON.stringify(value);
-      } catch (err) {
-        return String(value);
-      }
-    }
-    return String(value);
-  }
-
-  _trackEntityAttribute(map, entityId, attribute = null) {
-    if (!entityId) return;
-    if (!map.has(entityId)) map.set(entityId, new Set());
-    if (attribute) {
-      map.get(entityId).add(String(attribute));
-    }
-  }
-
-  _collectTrackedEntityAttributes() {
-    const tracked = new Map();
+  _collectTrackedEntityIds() {
+    const ids = [];
+    const seen = new Set();
     const ents = this._config?.entities || {};
-    const add = (entityId, attribute = null) => {
-      this._trackEntityAttribute(tracked, entityId, attribute);
+    const add = (entityId) => {
+      if (!entityId || seen.has(entityId)) return;
+      seen.add(entityId);
+      ids.push(entityId);
     };
     const addEntityConfig = (cfg) => {
       if (!cfg) return;
@@ -1731,14 +1715,11 @@ class CompactPowerCard extends (window.LitElement ||
         cfg.forEach(addEntityConfig);
         return;
       }
-      const entityId = this._extractEntityRef(cfg);
-      const attribute =
-        cfg && typeof cfg === "object" ? cfg.attribute || cfg.attr || null : null;
-      add(entityId, attribute);
+      add(this._extractEntityRef(cfg));
     };
     const addLabels = (labels) => {
       labels.forEach((lbl) => {
-        add(this._extractEntityRef(lbl?.entity), lbl?.attribute || lbl?.attr || null);
+        add(this._extractEntityRef(lbl?.entity));
       });
     };
 
@@ -1768,51 +1749,17 @@ class CompactPowerCard extends (window.LitElement ||
       add(this._extractEntityRef(cfg?.charge_entity || cfg?.chargeEntity));
       add(this._extractEntityRef(cfg?.discharge_entity || cfg?.dischargeEntity));
       const socRef = this._getBatterySocRef(cfg);
-      if (socRef?.entity) {
-        add(socRef.entity, socRef.attribute || null);
-      }
+      add(socRef?.entity);
     }
 
     const { sources } = this._getSourcesConfig();
     sources.forEach((src) => {
-      add(this._extractEntityRef(src?.entity), src?.attribute || src?.attr || null);
+      add(this._extractEntityRef(src?.entity));
       add(this._extractEntityRef(src?.switch_entity || src?.switchEntity));
       add(this._extractEntityRef(src?.name));
     });
 
-    return tracked;
-  }
-
-  _buildVisibleStateSignature(hass) {
-    const themeMode = hass?.themes?.darkMode ?? null;
-    const parts = [`theme=${this._stringifySignatureValue(themeMode)}`];
-    const tracked = this._trackedEntityAttributes || new Map();
-    if (!tracked.size) return parts.join("|");
-
-    const ids = Array.from(tracked.keys()).sort();
-    for (const entityId of ids) {
-      const st = hass?.states?.[entityId];
-      if (!st) {
-        parts.push(`${entityId}:missing`);
-        continue;
-      }
-      const attrs = st.attributes || {};
-      const attrParts = Array.from(tracked.get(entityId) || [])
-        .sort()
-        .map((attribute) => `${attribute}=${this._stringifySignatureValue(attrs?.[attribute])}`);
-      parts.push(
-        [
-          entityId,
-          `state=${this._stringifySignatureValue(st.state)}`,
-          `unit=${this._stringifySignatureValue(attrs.unit_of_measurement)}`,
-          `icon=${this._stringifySignatureValue(attrs.icon)}`,
-          `device_class=${this._stringifySignatureValue(attrs.device_class)}`,
-          ...attrParts,
-        ].join(",")
-      );
-    }
-
-    return parts.join("|");
+    return ids;
   }
 
   _startLoafObserver() {
@@ -1842,19 +1789,22 @@ class CompactPowerCard extends (window.LitElement ||
     const entries = typeof entryList?.getEntries === "function" ? entryList.getEntries() : [];
     if (!entries.length) return;
     const now = typeof performance?.now === "function" ? performance.now() : Date.now();
+    const { minDurationMs, activationCount } = CPC_LOAF_REDUCED_PERFORMANCE;
+    let sawLongFrame = false;
     for (const entry of entries) {
-      if ((entry?.duration || 0) <= 125) continue;
-      this._loafSamples.push(now);
-      return;
+      if ((entry?.duration || 0) < minDurationMs) continue;
+      sawLongFrame = true;
+      break;
     }
+    if (sawLongFrame) this._loafSamples.push(now);
     this._pruneLoafSamples(now);
-    if (this._loafSamples.length >= 3) {
+    if (this._loafSamples.length >= activationCount) {
       this._activateReducedPerformance("loaf", now);
     }
   }
 
   _pruneLoafSamples(now) {
-    const cutoff = now - 15000;
+    const cutoff = now - CPC_LOAF_REDUCED_PERFORMANCE.sampleWindowMs;
     this._loafSamples = (this._loafSamples || []).filter((timestamp) => timestamp >= cutoff);
   }
 
@@ -1873,7 +1823,7 @@ class CompactPowerCard extends (window.LitElement ||
 
   _activateReducedPerformance(reason, now) {
     const wasActive = this._reducedPerformanceActive;
-    const nextUntil = now + 30000;
+    const nextUntil = now + CPC_LOAF_REDUCED_PERFORMANCE.activeDurationMs;
     this._reducedPerformanceActive = true;
     this._lastReducedPerformanceReason = reason;
     this._reducedPerformanceUntil = Math.max(this._reducedPerformanceUntil || 0, nextUntil);
@@ -1887,8 +1837,8 @@ class CompactPowerCard extends (window.LitElement ||
     if (!this._reducedPerformanceActive) return;
     const now = typeof performance?.now === "function" ? performance.now() : Date.now();
     this._pruneLoafSamples(now);
-    if (this._loafSamples.length >= 3) {
-      this._reducedPerformanceUntil = now + 30000;
+    if (this._loafSamples.length >= CPC_LOAF_REDUCED_PERFORMANCE.activationCount) {
+      this._reducedPerformanceUntil = now + CPC_LOAF_REDUCED_PERFORMANCE.activeDurationMs;
       this._scheduleReducedPerformanceTimer(now);
       return;
     }
@@ -2238,73 +2188,26 @@ class CompactPowerCard extends (window.LitElement ||
     return null;
   }
 
-  _collectEntityIds() {
-    const ids = new Set();
-    const ents = this._config?.entities || {};
-    const add = (id) => {
-      if (id) ids.add(id);
-    };
-    const addEntityConfig = (cfg) => {
-      if (!cfg) return;
-      if (Array.isArray(cfg)) {
-        cfg.forEach(addEntityConfig);
-        return;
-      }
-      add(this._extractEntityRef(cfg));
-    };
+  _shouldUpdateForHass(hass) {
+    const nextThemeMode = hass?.themes?.darkMode ?? null;
+    const states = hass?.states || {};
+    const trackedEntityIds = this._trackedEntityIds || [];
+    const lastEntityStates = this._lastEntityStates || [];
+    let changed = !this._hasTrackedStateSnapshot || nextThemeMode !== this._lastThemeMode;
 
-    addEntityConfig(ents.pv);
-    addEntityConfig(ents.grid);
-    addEntityConfig(ents.home);
-    addEntityConfig(ents.battery);
-    add(this._extractEntityRef(ents.grid?.import_entity || ents.grid?.importEntity));
-    add(this._extractEntityRef(ents.grid?.export_entity || ents.grid?.exportEntity));
-
-    const pvLabels = this._normalizeLabels(ents.pv?.labels, null);
-    const gridLabels = this._normalizeLabels(ents.grid?.labels, null);
-    const batteryLabelsSource = Array.isArray(ents.battery)
-      ? ents.battery_labels || ents.battery?.labels
-      : ents.battery?.labels;
-    const batteryLabels = this._normalizeLabels(batteryLabelsSource, null);
-
-    pvLabels.forEach((lbl) => add(this._extractEntityRef(lbl?.entity)));
-    gridLabels.forEach((lbl) => add(this._extractEntityRef(lbl?.entity)));
-    batteryLabels.forEach((lbl) => add(this._extractEntityRef(lbl?.entity)));
-
-    const batteryList = Array.isArray(ents.battery)
-      ? ents.battery
-      : ents.battery
-      ? [ents.battery]
-      : [];
-    for (const cfg of batteryList) {
-      add(this._extractEntityRef(cfg?.charge_entity || cfg?.chargeEntity));
-      add(this._extractEntityRef(cfg?.discharge_entity || cfg?.dischargeEntity));
-      const socRef =
-        this._extractEntityRef(cfg?.battery_soc) ||
-        this._extractEntityRef(cfg?.soc) ||
-        this._extractEntityRef(cfg?.soc_entity) ||
-        this._extractEntityRef(cfg?.battery_soc_entity) ||
-        this._extractEntityRef(cfg?.battery_soc_id) ||
-        this._extractEntityRef(cfg?.soc_entity_id);
-      add(socRef);
+    // Only diff entities this card consumes, but keep the snapshot current while throttled.
+    for (let i = 0; i < trackedEntityIds.length; i += 1) {
+      const nextState = states[trackedEntityIds[i]] ?? null;
+      if (lastEntityStates[i] !== nextState) changed = true;
+      lastEntityStates[i] = nextState;
     }
 
-    const { sources } = this._getSourcesConfig();
-    sources.forEach((src) => {
-      add(this._extractEntityRef(src?.entity));
-      add(this._extractEntityRef(src?.switch_entity));
-      add(this._extractEntityRef(src?.name));
-    });
-
-    return ids;
-  }
-
-  _shouldUpdateForHass(hass) {
-    const signature = this._buildVisibleStateSignature(hass);
-    if (signature === this._lastVisibleStateSignature) return false;
-    this._lastVisibleStateSignature = signature;
-    this._lastThemeMode = hass?.themes?.darkMode ?? null;
+    this._lastEntityStates = lastEntityStates;
+    this._lastThemeMode = nextThemeMode;
+    this._hasTrackedStateSnapshot = true;
+    if (!changed) return false;
     this._invalidateDerivedSnapshot();
+    if (this._updateTimeout) return false;
     return true;
   }
 
@@ -2313,10 +2216,6 @@ class CompactPowerCard extends (window.LitElement ||
     if (Number.isFinite(raw)) return Math.min(5, Math.max(0, raw));
     const legacyCurved = this._coerceBoolean(this._config?.curved_lines, true);
     return legacyCurved ? 1 : 0;
-  }
-
-  _useCurvedLines() {
-    return this._getCurveFactor() > 0;
   }
 
   _useDevicePowerLines() {
@@ -2381,14 +2280,6 @@ class CompactPowerCard extends (window.LitElement ||
       cfg[`${kind}_color`] ||
       defaults[kind]
     );
-  }
-
-  _getHeightFactor() {
-    return 1;
-  }
-
-  _getEffectiveHeightFactor(batteryCount = 1) {
-    return 1;
   }
 
   _isLightTheme() {
@@ -2704,13 +2595,6 @@ class CompactPowerCard extends (window.LitElement ||
     return n;
   }
 
-  _fromWatts(val, unit) {
-    const u = String(unit || "").toLowerCase();
-    if (u === "kw") return val / 1000;
-    if (u === "mw") return val / 1000000;
-    return val;
-  }
-
   _parseThreshold(val) {
     const n = typeof val === "string" ? parseFloat(val) : val;
     return Number.isFinite(n) ? n : null;
@@ -2999,9 +2883,6 @@ class CompactPowerCard extends (window.LitElement ||
       homeEffectiveDisplay = inferredDisplay;
       homeEffectiveFlow = Math.max(inferredBase, 0);
     }
-    this._homeEffective = homeEffectiveDisplay;
-    this._homeEffectiveUnit = "W";
-
     const pvColor = this._getColor("pv", pvCfg);
     const gridColor = this._getColor("grid", gridCfg);
     const homeColor = this._getColor("home", homeCfg);
