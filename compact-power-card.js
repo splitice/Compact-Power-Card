@@ -537,6 +537,7 @@ class CompactPowerCard extends (window.LitElement ||
     this._lastRenderedDeviceLineSignature = null;
     this._lastRenderedDeviceLineGeometryKey = null;
     this._lastLayoutSyncKey = null;
+    this._lastScaleValue = null;
     this._lastHomeGradientSignature = null;
     this._updateTimeout = null;
     this._homeGradientFrame = null;
@@ -623,6 +624,28 @@ class CompactPowerCard extends (window.LitElement ||
         background: transparent;
         box-shadow: none;
         border: none;
+      }
+
+      .performance-indicator {
+        position: absolute;
+        top: 8px;
+        left: 8px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border-radius: 999px;
+        color: var(--warning-color, #f2c94c);
+        background: var(--ha-card-background, var(--card-background-color));
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18);
+        opacity: 0.92;
+        pointer-events: none;
+        z-index: 2;
+      }
+
+      .performance-indicator ha-icon {
+        --mdc-icon-size: 16px;
       }
 
       .canvas {
@@ -1226,10 +1249,18 @@ class CompactPowerCard extends (window.LitElement ||
 
     if (layoutChanged) {
       this._lastLayoutSyncKey = layoutSyncKey;
-      this._adjustLayout();
     }
 
     if (!this.shadowRoot || !snapshot) {
+      this._renderState = null;
+      return;
+    }
+    const hasMeasuredLayout =
+      Number.isFinite(this._hostWidth) &&
+      this._hostWidth > 0 &&
+      Number.isFinite(this._hostHeight) &&
+      this._hostHeight > 0;
+    if (!hasMeasuredLayout) {
       this._renderState = null;
       return;
     }
@@ -1294,9 +1325,32 @@ class CompactPowerCard extends (window.LitElement ||
 
   _getHostDimensions() {
     return {
-      width: this._hostWidth ?? this.clientWidth ?? this.offsetWidth ?? 0,
-      height: this._hostHeight ?? this.clientHeight ?? this.offsetHeight ?? 0,
+      width: this._hostWidth ?? 0,
+      height: this._hostHeight ?? 0,
     };
+  }
+
+  _getResizeObserverDimensions(entry) {
+    if (!entry) return null;
+    const borderBox = Array.isArray(entry.borderBoxSize) ? entry.borderBoxSize[0] : entry.borderBoxSize;
+    if (
+      borderBox &&
+      Number.isFinite(borderBox.inlineSize) &&
+      Number.isFinite(borderBox.blockSize)
+    ) {
+      return {
+        width: borderBox.inlineSize,
+        height: borderBox.blockSize,
+      };
+    }
+    const rect = entry.contentRect;
+    if (rect && Number.isFinite(rect.width) && Number.isFinite(rect.height)) {
+      return {
+        width: rect.width,
+        height: rect.height,
+      };
+    }
+    return null;
   }
 
   _getLayoutMetrics({ hasPv, hasBattery, hasAnyLabels }) {
@@ -1552,10 +1606,10 @@ class CompactPowerCard extends (window.LitElement ||
     super.connectedCallback();
     if (!this._resizeObserver) {
       this._resizeObserver = new ResizeObserver((entries) => {
-        const rect = entries?.[0]?.contentRect;
-        if (rect) {
-          const newW = rect.width;
-          const newH = rect.height;
+        const size = this._getResizeObserverDimensions(entries?.[0]);
+        if (size) {
+          const newW = size.width;
+          const newH = size.height;
           if (newW > 0 && newH > 0 && !this._layoutReady) {
             this._layoutReady = true;
             this.requestUpdate();
@@ -1574,6 +1628,8 @@ class CompactPowerCard extends (window.LitElement ||
           if (prevW == null || prevH == null) {
             this.requestUpdate();
           }
+          this._updateScale(newW);
+          return;
         }
         this._updateScale();
       });
@@ -1621,44 +1677,19 @@ class CompactPowerCard extends (window.LitElement ||
     super.disconnectedCallback();
   }
 
-  _updateScale() {
-    const hostWidth = this._getHostDimensions().width;
-    if (!hostWidth || hostWidth < 200) {
-      this.style.setProperty("--cpc-scale", "1");
+  _updateScale(hostWidth = this._hostWidth) {
+    const resolvedWidth = Number.isFinite(hostWidth) ? hostWidth : 0;
+    let nextScaleValue = "1";
+    if (resolvedWidth >= 200) {
+      const baseWidth = 512; // match viewBox width
+      const widthScale = resolvedWidth / baseWidth;
+      nextScaleValue = Math.max(0.8, Math.min(1.0, widthScale)).toFixed(3);
+    }
+    if (nextScaleValue === this._lastScaleValue) {
       return;
     }
-    const baseWidth = 512; // match viewBox width
-    const widthScale = hostWidth / baseWidth;
-    const scale = Math.max(0.8, Math.min(1.0, widthScale));
-    this.style.setProperty("--cpc-scale", scale.toFixed(3));
-  }
-
-  _adjustLayout() {
-    const root = this.shadowRoot;
-    if (!root) return;
-    this._updateScale();
-    const header = root.querySelector(".pv-header");
-    const svg = root.querySelector("svg");
-    const line = root.getElementById("line-pv-home");
-    if (!header || !svg || !line) return;
-
-    svg.style.marginTop = "0px";
-    svg.style.transform = "translateY(0px)";
-
-    const viewBoxHeight = svg.viewBox?.baseVal?.height || 0;
-    const lineY = line.y1?.baseVal?.value ?? null;
-    if (viewBoxHeight <= 0 || lineY == null) return;
-
-    const headerBottom = header.offsetTop + header.offsetHeight;
-    const svgTop = svg.offsetTop;
-    const linePixelOffset = (lineY / viewBoxHeight) * svg.clientHeight;
-    const lineTop = svgTop + linePixelOffset;
-    const gap = lineTop - headerBottom;
-
-    const desiredGap = 12;
-    const delta = gap - desiredGap;
-
-    svg.style.transform = `translateY(${-delta}px)`;
+    this._lastScaleValue = nextScaleValue;
+    this.style.setProperty("--cpc-scale", nextScaleValue);
   }
 
   _invalidateDerivedSnapshot() {
@@ -1811,13 +1842,11 @@ class CompactPowerCard extends (window.LitElement ||
     const entries = typeof entryList?.getEntries === "function" ? entryList.getEntries() : [];
     if (!entries.length) return;
     const now = typeof performance?.now === "function" ? performance.now() : Date.now();
-    let qualifyingCount = 0;
     for (const entry of entries) {
-      if ((entry?.duration || 0) <= 75) continue;
+      if ((entry?.duration || 0) <= 125) continue;
       this._loafSamples.push(now);
-      qualifyingCount += 1;
+      return;
     }
-    if (!qualifyingCount) return;
     this._pruneLoafSamples(now);
     if (this._loafSamples.length >= 3) {
       this._activateReducedPerformance("loaf", now);
@@ -3670,7 +3699,7 @@ class CompactPowerCard extends (window.LitElement ||
         dot.style.removeProperty("--cpc-flow-duration");
         dot.style.removeProperty("--cpc-flow-start");
         dot.style.removeProperty("--cpc-flow-end");
-        dot.style.setProperty("opacity", "1");
+        dot.style.setProperty("opacity", "0");
       } else {
         dot.style.removeProperty("opacity");
         dot.style.setProperty("offset-distance", start);
@@ -4497,6 +4526,7 @@ class CompactPowerCard extends (window.LitElement ||
 
     const layoutReady = this._layoutReady;
     const hideCardBackground = this._coerceBoolean(this._config?.hide_card_background, false);
+    const loafReduced = reducedPerformanceActive && this._lastReducedPerformanceReason === "loaf";
 
     return html`
       <ha-card class="${[
@@ -4512,6 +4542,11 @@ class CompactPowerCard extends (window.LitElement ||
       ]
         .filter(Boolean)
         .join(" ")}">
+        ${loafReduced
+          ? html`<div class="performance-indicator" title="Animations paused after a long animation frame was detected">
+              <ha-icon icon="mdi:pause"></ha-icon>
+            </div>`
+          : ""}
         <div class="canvas">
           <svg viewBox="0 0 ${baseWidth} ${viewHeight}" preserveAspectRatio="xMidYMid meet">
 
